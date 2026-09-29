@@ -6,3 +6,5 @@ Imagem de implantação do backend do Ao Ponto Bot.
 - Banco persistente: `/data/ao_ponto.db`
 - Backups persistentes: `/data/backups`
 - Variável obrigatória: `ADMIN_PASSWORD`
+
+Implantação automática configurada no Deplexo.
