@@ -18,6 +18,9 @@ FROM debian:bookworm-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libsqlite3-dev \
+    && ln -sf /usr/lib/x86_64-linux-gnu/libsqlite3.so.0 /usr/local/lib/libsqlite3.so \
+    && ldconfig \
+    && test -e /usr/local/lib/libsqlite3.so \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app/backend
