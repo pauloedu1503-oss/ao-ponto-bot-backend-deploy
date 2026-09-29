@@ -20,7 +20,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-ARG APP_SOURCE_REV=191dc2d1b244e4e38073e32276227a6ed07cddbb
+ARG APP_SOURCE_REV=90646c18b96379d44b27d9e4cd52641304948635
 RUN git clone https://github.com/pauloedu1503-oss/ao-ponto-bot-producao.git /src \
     && cd /src \
     && git checkout "$APP_SOURCE_REV"
