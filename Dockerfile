@@ -17,7 +17,7 @@ RUN dart compile exe bin/server.dart -o /app/backend/server
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates libsqlite3-0 \
+    && apt-get install -y --no-install-recommends ca-certificates libsqlite3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app/backend
