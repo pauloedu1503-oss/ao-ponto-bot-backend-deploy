@@ -8,3 +8,5 @@ Imagem de implantação do backend do Ao Ponto Bot.
 - Variável obrigatória: `ADMIN_PASSWORD`
 
 Implantação automática configurada no Deplexo.
+
+- Fila de respostas independentes: um envio incerto não bloqueia os seguintes.
