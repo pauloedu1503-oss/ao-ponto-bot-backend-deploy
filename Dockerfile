@@ -20,7 +20,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends git ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone --depth=1 https://github.com/pauloedu1503-oss/ao-ponto-bot-producao.git /src
+ARG APP_SOURCE_REV=191dc2d1b244e4e38073e32276227a6ed07cddbb
+RUN git clone https://github.com/pauloedu1503-oss/ao-ponto-bot-producao.git /src \
+    && cd /src \
+    && git checkout "$APP_SOURCE_REV"
 
 WORKDIR /src/whatsapp_bridge
 RUN npm ci --omit=dev
