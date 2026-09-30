@@ -309,9 +309,7 @@ class BotService {
       msg.telefone,
       '${prefixo}🍱 *${config['nomeEstabelecimento']}*\n'
       'Olá! 👋 O que deseja?\n'
-      '1️⃣ Fazer pedido\n'
-      '2️⃣ Ver cardápio\n'
-      '3️⃣ Falar com atendente\n\n'
+      '\n'
       '💡 Durante o pedido, você pode usar *VOLTAR*, *CANCELAR* ou *ATENDENTE* quando precisar.',
       _botoesInicio(),
     );
