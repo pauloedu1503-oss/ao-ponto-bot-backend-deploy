@@ -291,6 +291,7 @@ class BotService {
     MensagemWhatsApp msg,
     Map<String, dynamic> config, {
     String? aviso,
+    bool forcarBoasVindas = false,
   }) async {
     final dados = <String, dynamic>{
       'clienteNome': msg.nome,
@@ -304,23 +305,37 @@ class BotService {
     );
 
     final entrada = _normalizar(msg.entrada);
-    if (aviso == null && _entradaEhOpcaoInicio(entrada)) {
+    if (aviso == null && !forcarBoasVindas && _entradaEhOpcaoInicio(entrada)) {
       await _tratarInicio(msg, config, dados, entrada);
       return;
     }
 
-    final prefixo = aviso == null ? '' : '$aviso\n';
+    final mensagens =
+        Map<String, dynamic>.from(config['mensagens'] as Map? ?? {});
+    final boasVindas = (mensagens['boasVindas'] ??
+            'Olá! 👋 Bem-vindo à ${config['nomeEstabelecimento']}.')
+        .toString()
+        .trim();
+    final pergunta =
+        _textoFluxo('inicio', 'mensagem', 'Como podemos ajudar?').trim();
+    final linhas = <String>[
+      if (aviso?.trim().isNotEmpty ?? false) aviso!.trim(),
+      boasVindas,
+      pergunta,
+      '💡 Durante o pedido, você pode usar *VOLTAR*, *CANCELAR* ou *ATENDENTE* quando precisar.',
+    ];
     await whatsapp.enviarBotoes(
       msg.telefone,
-      '${prefixo}🍱 *${config['nomeEstabelecimento']}*\n'
-      'Olá! 👋 O que deseja?\n'
-      '\n'
-      '💡 Durante o pedido, você pode usar *VOLTAR*, *CANCELAR* ou *ATENDENTE* quando precisar.',
+      linhas.join('\n\n'),
       _botoesInicio(),
     );
   }
 
-  void _salvarInicioLimpo(String telefone, String nome) {
+  void _salvarInicioLimpo(
+    String telefone,
+    String nome, {
+    bool boasVindasNaProximaMensagem = false,
+  }) {
     banco.salvarSessao(
       telefone: telefone,
       nome: nome,
@@ -328,6 +343,7 @@ class BotService {
       dados: {
         'clienteNome': nome,
         'itens': <dynamic>[],
+        if (boasVindasNaProximaMensagem) 'aguardaBoasVindas': true,
       },
     );
   }
@@ -375,6 +391,11 @@ class BotService {
     final etapa = sessao['etapa']?.toString() ?? 'inicio';
     final dados = Map<String, dynamic>.from(sessao['dados'] as Map? ?? {});
     final entrada = _normalizar(msg.entrada);
+
+    if (etapa == 'inicio' && dados['aguardaBoasVindas'] == true) {
+      await _iniciar(msg, config, forcarBoasVindas: true);
+      return;
+    }
 
     switch (etapa) {
       case 'inicio':
@@ -535,11 +556,6 @@ class BotService {
       final m = Map<String, dynamic>.from(t as Map);
       linhas.add('• ${m['nome']} — ${moeda((m['preco'] as num).toDouble())}');
     }
-    linhas.addAll([
-      '',
-      '*Misturas:*',
-      ...misturas.map((e) => '• ${(e as Map)['nome']}'),
-    ]);
     if (fluxoArroz) {
       linhas.addAll([
         '',
@@ -556,13 +572,14 @@ class BotService {
     }
     linhas.addAll([
       '',
+      '*Misturas:*',
+      ...misturas.map((e) => '• ${(e as Map)['nome']}'),
+    ]);
+    linhas.addAll([
+      '',
       '*Acompanhamentos:*',
       ...acompanhamentos.map((e) => '• ${(e as Map)['nome']}'),
     ]);
-    if (config['saladaIncluida'] == true) {
-      linhas
-          .add('\n🥗 ${config['descricaoSalada'] ?? 'Salada do dia'} inclusa.');
-    }
     if (bebidas.isNotEmpty) {
       linhas.addAll([
         '',
@@ -572,6 +589,10 @@ class BotService {
           return '• ${b['nome']} — ${moeda((b['preco'] as num).toDouble())}';
         }),
       ]);
+    }
+    if (config['saladaIncluida'] == true) {
+      linhas
+          .add('\n🥗 ${config['descricaoSalada'] ?? 'Salada do dia'} inclusa.');
     }
     linhas.add(
         '\n${_textoFluxo('cardapio', 'rodape', 'O mesmo padrão em todos os tamanhos; muda a quantidade.')}');
@@ -791,7 +812,7 @@ class BotService {
       final cardapio = banco.obterCardapio();
       await whatsapp.enviarBotoes(
         msg.telefone,
-        '🍚 Sua marmita acompanha *${_descricaoBase(cardapio)}*.\n\n'
+        '🍚 Você escolheu *${_descricaoBaseEscolhida(cardapio, dados)}*.\n\n'
         '${_textoFluxo('mistura', 'mensagem', 'Escolha a mistura:')}',
         opcoes,
       );
@@ -799,7 +820,8 @@ class BotService {
       final cardapio = banco.obterCardapio();
       await whatsapp.enviarLista(
         msg.telefone,
-        texto: '🍚 Sua marmita acompanha *${_descricaoBase(cardapio)}*.\n\n'
+        texto:
+            '🍚 Você escolheu *${_descricaoBaseEscolhida(cardapio, dados)}*.\n\n'
             '${_textoFluxo('mistura', 'mensagem', 'Escolha a mistura:')}',
         tituloBotao: _textoFluxo('mistura', 'tituloLista', 'Ver misturas'),
         opcoes: opcoes,
@@ -1622,7 +1644,7 @@ class BotService {
     final base = alterando
         ? _textoFluxo('observacao', 'mensagemAlterar', 'Altere sua observação.')
         : _textoFluxo('observacao', 'mensagem',
-            'Deseja alguma observação?\nEx.: sem feijão, pouca salada.');
+            'Deseja alguma observação?\nEx.: sem feijão.');
     await whatsapp.enviarTexto(
       msg.telefone,
       '$base\nDigite *$nenhuma* para nenhuma.',
@@ -1706,8 +1728,8 @@ class BotService {
     final opcoes = lista
         .map((b) => <String, String>{
               'id': 'beb:${b['id']}',
-              'titulo': b['nome'].toString(),
-              'descricao': moeda((b['preco'] as num).toDouble()),
+              'titulo': '${b['nome']} ${moeda((b['preco'] as num).toDouble())}',
+              'descricao': 'Escolher bebida',
             })
         .toList()
       ..add({
@@ -2175,7 +2197,11 @@ class BotService {
     // Pedido confirmado encerra totalmente o carrinho anterior. Assim o próximo
     // pedido do mesmo telefone sempre nasce limpo e um segundo clique em um botão
     // antigo de confirmação não cria outro pedido.
-    _salvarInicioLimpo(msg.telefone, msg.nome);
+    _salvarInicioLimpo(
+      msg.telefone,
+      msg.nome,
+      boasVindasNaProximaMensagem: true,
+    );
 
     final mensagens =
         Map<String, dynamic>.from(config['mensagens'] as Map? ?? {});
@@ -2297,6 +2323,24 @@ class BotService {
         cardapio['fluxoArrozAtivo'] == true ? 'arroz à escolha' : 'arroz';
     final feijao =
         cardapio['fluxoFeijaoAtivo'] == true ? 'feijão à escolha' : 'feijão';
+    return '$arroz + $feijao';
+  }
+
+  String _descricaoBaseEscolhida(
+    Map<String, dynamic> cardapio,
+    Map<String, dynamic> dados,
+  ) {
+    final item = Map<String, dynamic>.from(dados['itemAtual'] as Map? ?? {});
+    final arroz = cardapio['fluxoArrozAtivo'] == true
+        ? (item['arrozNome']?.toString().trim().isNotEmpty == true
+            ? item['arrozNome'].toString().trim()
+            : 'arroz à escolha')
+        : 'arroz';
+    final feijao = cardapio['fluxoFeijaoAtivo'] == true
+        ? (item['feijaoNome']?.toString().trim().isNotEmpty == true
+            ? item['feijaoNome'].toString().trim()
+            : 'feijão à escolha')
+        : 'feijão';
     return '$arroz + $feijao';
   }
 

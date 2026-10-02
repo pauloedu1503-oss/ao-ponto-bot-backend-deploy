@@ -38,6 +38,7 @@ class Banco {
       _migrarConfiguracaoV13();
       _migrarConfiguracaoV14();
       _migrarMensagemPedidoEnviado();
+      _migrarExemploObservacao();
       _sanearEstadoInicial();
       db.execute(
           "UPDATE push_saida SET status = 'pendente' WHERE status = 'enviando'");
@@ -439,6 +440,27 @@ class Banco {
       [jsonEncode(dados), (row['versao'] as int) + 1, agoraIso()],
     );
     log('INFO', 'mensagem_pedido_enviado_atualizada');
+  }
+
+  void _migrarExemploObservacao() {
+    final row =
+        db.select('SELECT json, versao FROM configuracao WHERE id = 1').first;
+    final dados =
+        Map<String, dynamic>.from(jsonDecode(row['json'] as String) as Map);
+    final fluxo = Map<String, dynamic>.from(dados['fluxo'] as Map? ?? {});
+    final observacao =
+        Map<String, dynamic>.from(fluxo['observacao'] as Map? ?? {});
+    const anterior =
+        'Deseja alguma observação?\nEx.: sem feijão, pouca salada.';
+    if (observacao['mensagem'] != anterior) return;
+    observacao['mensagem'] = 'Deseja alguma observação?\nEx.: sem feijão.';
+    fluxo['observacao'] = observacao;
+    dados['fluxo'] = fluxo;
+    db.execute(
+      'UPDATE configuracao SET json = ?, versao = ?, atualizado_em = ? WHERE id = 1',
+      [jsonEncode(dados), (row['versao'] as int) + 1, agoraIso()],
+    );
+    log('INFO', 'exemplo_observacao_atualizado');
   }
 
   void _migrarConfiguracaoV14() {

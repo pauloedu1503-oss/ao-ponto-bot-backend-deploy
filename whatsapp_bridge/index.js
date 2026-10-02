@@ -371,6 +371,12 @@ function transformarInterativoEmTexto(payload) {
     linhas.push('');
   }
 
+  // Quando o backend já incluiu opções numeradas para preservar nomes longos,
+  // não repete abaixo os rótulos curtos dos botões/listas.
+  if (pergunta.split('\n').some((linha) => /^\s*\d+\s*-\s+\S/.test(linha))) {
+    return pergunta;
+  }
+
   if (interactive.type === 'button') {
     const botoes =
       interactive.action?.buttons ?? [];
