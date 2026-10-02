@@ -809,20 +809,16 @@ class BotService {
             })
         .toList();
     if (opcoes.length <= 3) {
-      final cardapio = banco.obterCardapio();
       await whatsapp.enviarBotoes(
         msg.telefone,
-        '🍚 Você escolheu *${_descricaoBaseEscolhida(cardapio, dados)}*.\n\n'
-        '${_textoFluxo('mistura', 'mensagem', 'Escolha a mistura:')}',
+        '${_textoFluxo('mistura', 'mensagem', 'Escolha a mistura:')}\n\n',
         opcoes,
       );
     } else {
-      final cardapio = banco.obterCardapio();
       await whatsapp.enviarLista(
         msg.telefone,
         texto:
-            '🍚 Você escolheu *${_descricaoBaseEscolhida(cardapio, dados)}*.\n\n'
-            '${_textoFluxo('mistura', 'mensagem', 'Escolha a mistura:')}',
+            '${_textoFluxo('mistura', 'mensagem', 'Escolha a mistura:')}\n\n',
         tituloBotao: _textoFluxo('mistura', 'tituloLista', 'Ver misturas'),
         opcoes: opcoes,
       );
