@@ -811,13 +811,13 @@ class BotService {
     if (opcoes.length <= 3) {
       await whatsapp.enviarBotoes(
         msg.telefone,
-        _textoFluxo('mistura', 'mensagem', 'Escolha a mistura:'),
+        '${_textoFluxo('mistura', 'mensagem', 'Escolha a mistura:')}\n',
         opcoes,
       );
     } else {
       await whatsapp.enviarLista(
         msg.telefone,
-        texto: _textoFluxo('mistura', 'mensagem', 'Escolha a mistura:'),
+        texto: '${_textoFluxo('mistura', 'mensagem', 'Escolha a mistura:')}\n',
         tituloBotao: _textoFluxo('mistura', 'tituloLista', 'Ver misturas'),
         opcoes: opcoes,
       );
