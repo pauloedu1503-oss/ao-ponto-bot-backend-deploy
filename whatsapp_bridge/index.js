@@ -843,13 +843,8 @@ async function processarEntrada(
       },
     );
 
-    try {
-      await sockAtual.readMessages([
-        msg.key,
-      ]);
-    } catch {
-      // Marcar como lida não é crítico.
-    }
+    // Não confirmar leitura automaticamente durante o teste, para que o
+    // WhatsApp Business possa manter a notificação no celular.
 
     // Não espera o próximo intervalo.
     await buscarSaidas();

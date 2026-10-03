@@ -92,7 +92,8 @@ class BotService {
         banco.finalizarMensagem(msg.id);
         return;
       }
-      await whatsapp.marcarComoLida(msg.id);
+      // Mantém a mensagem como não lida para permitir a notificação no celular
+      // durante o teste. Reative marcarComoLida se quiser voltar ao comportamento anterior.
 
       var sessao = banco.obterSessao(msg.telefone);
       if (sessao?['modoHumano'] == true) {
