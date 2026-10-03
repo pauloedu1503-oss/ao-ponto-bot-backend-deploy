@@ -23,6 +23,7 @@ class Api {
 
   Timer? _timer;
   bool _processando = false;
+  DateTime _ultimaManutencaoMemoria = DateTime.now();
   Api(this.banco, this.auth, this.bot, this.push);
 
   void iniciarWorker() {
@@ -61,10 +62,34 @@ class Api {
       }
       await bot.whatsapp.drenar();
       await push.drenar();
+      _manutencaoDiariaMemoria();
     } catch (e) {
       banco.log('ERROR', 'worker_erro', e.runtimeType.toString());
     } finally {
       _processando = false;
+    }
+  }
+
+  void _manutencaoDiariaMemoria() {
+    final agora = DateTime.now();
+    if (agora.difference(_ultimaManutencaoMemoria) <
+        const Duration(hours: 24)) {
+      return;
+    }
+    _ultimaManutencaoMemoria = agora;
+
+    try {
+      final antesMb = ProcessInfo.currentRss ~/ (1024 * 1024);
+      banco.db.execute('PRAGMA shrink_memory');
+      final depoisMb = ProcessInfo.currentRss ~/ (1024 * 1024);
+      banco.log(
+        'INFO',
+        'manutencao_diaria_memoria',
+        'RSS antes: ${antesMb}MB; depois: ${depoisMb}MB.',
+      );
+    } catch (e) {
+      banco.log(
+          'WARN', 'manutencao_diaria_memoria_falhou', e.runtimeType.toString());
     }
   }
 
