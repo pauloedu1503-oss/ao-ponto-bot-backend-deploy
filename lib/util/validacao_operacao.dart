@@ -28,7 +28,7 @@ class ValidacaoOperacao {
           'Configurações > Pagamento: ative pelo menos uma forma.');
     }
 
-    final expira = (dados['sessaoExpiraMinutos'] as num?)?.toInt() ?? 30;
+    final expira = (dados['sessaoExpiraMinutos'] as num?)?.toInt() ?? 60;
     if (expira < 5 || expira > 240) {
       throw ArgumentError(
           'A expiração da conversa deve ficar entre 5 e 240 minutos.');

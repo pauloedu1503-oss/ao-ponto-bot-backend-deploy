@@ -44,10 +44,18 @@ class BotService {
     if (config['botAtivo'] == false) return;
     final estado = _estadoEfetivo(config);
     if (estado == 'atendendo') {
-      await whatsapp.enviarBotoes(
+      _salvarInicioLimpo(
         telefone,
-        '${_textoFluxo('sistema', 'retomado', '🤖 Atendimento automático retomado.')}\n\n${_textoFluxo('inicio', 'mensagem', 'Como podemos ajudar?')}',
-        _botoesInicio(),
+        nome,
+        boasVindasNaProximaMensagem: true,
+      );
+      await whatsapp.enviarTexto(
+        telefone,
+        _textoFluxo(
+          'sistema',
+          'retomado',
+          '🤖 Atendimento automático retomado.',
+        ),
       );
       return;
     }
@@ -116,23 +124,27 @@ class BotService {
         return;
       }
 
-      final expirou = _sessaoExpirou(sessao, config);
-      if (expirou) {
-        banco.excluirSessao(msg.telefone);
-        sessao = null;
+      if (msg.entrada.isEmpty) {
+        // Mensagens sem texto extraível (por exemplo, mídia sem legenda) não
+        // devem gerar uma resposta automática a cada evento recebido.
+        banco.finalizarMensagem(msg.id);
+        return;
       }
 
       if (msg.enviadaEm != null &&
           DateTime.now().toUtc().difference(msg.enviadaEm!).inMinutes >
-              (config['sessaoExpiraMinutos'] as num? ?? 30)) {
+              (config['sessaoExpiraMinutos'] as num? ?? 60)) {
         banco.finalizarMensagem(msg.id);
         return;
       }
-      if (msg.entrada.isEmpty) {
-        await whatsapp.enviarTexto(msg.telefone,
-            'Envie uma mensagem de texto ou escolha uma opção. Para ajuda, digite atendente.');
-        banco.finalizarMensagem(msg.id);
-        return;
+
+      final expirou = _sessaoExpirou(sessao, config);
+      final pedidoEmAndamentoExpirou = expirou &&
+          sessao != null &&
+          sessao['etapa']?.toString() != 'inicio';
+      if (expirou) {
+        banco.excluirSessao(msg.telefone);
+        sessao = null;
       }
       final entrada = _normalizar(msg.entrada);
       if (sessao?['etapa'] == 'confirmar_cancelamento') {
@@ -181,8 +193,19 @@ class BotService {
         await _iniciar(
           msg,
           config,
-          aviso: '⏱️ Seu pedido anterior expirou por inatividade.',
+          aviso: pedidoEmAndamentoExpirou
+              ? '⏱️ Seu pedido anterior expirou por inatividade.'
+              : null,
+          forcarBoasVindas: true,
         );
+        banco.finalizarMensagem(msg.id);
+        return;
+      }
+
+      if (sessao != null &&
+          sessao['etapa'] != 'inicio' &&
+          _contemTermo(entrada, ['cardapio', 'menu'])) {
+        await _mostrarCardapio(msg, config, incluirBotoes: false);
         banco.finalizarMensagem(msg.id);
         return;
       }
@@ -212,13 +235,9 @@ class BotService {
     Map<String, dynamic> config,
   ) {
     if (sessao == null) return false;
-    // A etapa inicial não representa um pedido em andamento. Ela é mantida
-    // depois de concluir ou cancelar para receber a próxima mensagem, portanto
-    // nunca deve gerar aviso de pedido expirado.
-    if (sessao['etapa']?.toString() == 'inicio') return false;
     final ultima =
         DateTime.tryParse(sessao['ultimaAtividade']?.toString() ?? '');
-    final minutos = (config['sessaoExpiraMinutos'] as num?)?.toInt() ?? 30;
+    final minutos = (config['sessaoExpiraMinutos'] as num?)?.toInt() ?? 60;
     return ultima == null ||
         agoraLocal().difference(ultima).inMinutes >= minutos;
   }
@@ -305,8 +324,9 @@ class BotService {
     );
 
     final entrada = _normalizar(msg.entrada);
-    if (aviso == null && !forcarBoasVindas && _entradaEhOpcaoInicio(entrada)) {
-      await _tratarInicio(msg, config, dados, entrada);
+    final opcaoInicio = _resolverOpcaoInicio(entrada);
+    if (aviso == null && !forcarBoasVindas && opcaoInicio != null) {
+      await _tratarInicio(msg, config, dados, opcaoInicio);
       return;
     }
 
@@ -363,24 +383,71 @@ class BotService {
         },
       ];
 
-  bool _entradaEhOpcaoInicio(String entrada) {
-    return _corresponde(entrada, [
+  String? _resolverOpcaoInicio(String entrada) {
+    final texto = _normalizar(entrada);
+    if (_corresponde(texto, [
       'inicio_pedido',
-      'inicio_cardapio',
-      'inicio_humano',
       '1',
-      '2',
-      '3',
       'fazer pedido',
       'pedido',
+      _textoFluxo('inicio', 'botaoPedido', 'Fazer pedido'),
+    ])) {
+      return 'inicio_pedido';
+    }
+    if (_corresponde(texto, [
+      'inicio_cardapio',
+      '2',
       'ver cardapio',
       'cardapio',
+      _textoFluxo('inicio', 'botaoCardapio', 'Ver cardápio'),
+    ])) {
+      return 'inicio_cardapio';
+    }
+    if (_corresponde(texto, [
+      'inicio_humano',
+      '3',
       'falar atendente',
       'atendente',
-      _textoFluxo('inicio', 'botaoPedido', 'Fazer pedido'),
-      _textoFluxo('inicio', 'botaoCardapio', 'Ver cardápio'),
       _textoFluxo('inicio', 'botaoHumano', 'Falar atendente'),
+    ])) {
+      return 'inicio_humano';
+    }
+
+    if (_contemTermo(texto, ['nao', 'nunca', 'sem'])) return null;
+
+    // Em linguagem natural, qualquer menção ao cardápio ou menu escolhe essa
+    // opção, mesmo que a mensagem tenha outras palavras.
+    if (_contemTermo(texto, ['cardapio', 'menu'])) {
+      return 'inicio_cardapio';
+    }
+
+    final falaDePedido = _contemTermo(texto, [
+      'pedido',
+      'pedir',
+      'marmita',
+      'marmitas',
+      'almoco',
+      'almocar',
+      'refeicao',
+      'refeicoes',
+      'comida',
+      'comprar',
+      'encomendar',
     ]);
+    final expressaIntencaoDeComprar = _contemTermo(texto, [
+      'quero',
+      'queria',
+      'gostaria',
+      'vou',
+      'fazer',
+      'pedir',
+      'comprar',
+      'encomendar',
+      'montar',
+      'preciso',
+    ]);
+    if (falaDePedido && expressaIntencaoDeComprar) return 'inicio_pedido';
+    return null;
   }
 
   Future<void> _continuar(
@@ -467,6 +534,7 @@ class BotService {
     Map<String, dynamic> dados,
     String entrada,
   ) async {
+    entrada = _resolverOpcaoInicio(entrada) ?? _normalizar(entrada);
     if (_corresponde(entrada, [
       'inicio_pedido',
       '1',
@@ -515,6 +583,7 @@ class BotService {
   Future<void> _mostrarCardapio(
     MensagemWhatsApp msg,
     Map<String, dynamic> config,
+    {bool incluirBotoes = true}
   ) async {
     final c = banco.obterCardapio();
     final tamanhos = (c['tamanhos'] as List)
@@ -596,10 +665,12 @@ class BotService {
     }
     linhas.add(
         '\n${_textoFluxo('cardapio', 'rodape', 'O mesmo padrão em todos os tamanhos; muda a quantidade.')}');
-    await whatsapp.enviarBotoes(
-      msg.telefone,
-      linhas.join('\n'),
-      [
+    final texto = linhas.join('\n');
+    if (!incluirBotoes) {
+      await whatsapp.enviarTexto(msg.telefone, texto);
+      return;
+    }
+    await whatsapp.enviarBotoes(msg.telefone, texto, [
         {
           'id': 'inicio_pedido',
           'titulo': _textoFluxo('inicio', 'botaoPedido', 'Fazer pedido')
@@ -608,8 +679,7 @@ class BotService {
           'id': 'inicio_humano',
           'titulo': _textoFluxo('inicio', 'botaoHumano', 'Falar atendente')
         },
-      ],
-    );
+      ]);
   }
 
   Future<void> _mostrarTamanhos(
@@ -1079,7 +1149,8 @@ class BotService {
     final opcoes = (dados['recebimentosExibidos'] as List? ?? atuais)
         .map((e) => Map<String, String>.from(e as Map))
         .toList();
-    final entradaNatural = _correspondeIntencao(entrada, [
+    final entradaNatural = _resolverFormaRecebimento(entrada) ??
+        (_correspondeIntencao(entrada, [
       'entrega',
       'entregar',
       'quero entrega',
@@ -1097,7 +1168,7 @@ class BotService {
             'buscar no local',
           ])
             ? 'rec_retirada'
-            : entrada;
+            : entrada);
     final opcao = _acharOpcaoSimples(entradaNatural, opcoes);
     if (opcao == null || !atuais.any((e) => e['id'] == opcao['id'])) {
       await _mostrarRecebimento(msg, config, dados);
@@ -1497,7 +1568,8 @@ class BotService {
     final opcoes = (dados['pagamentosExibidos'] as List? ?? atuais)
         .map((e) => Map<String, String>.from(e as Map))
         .toList();
-    final entradaNatural = _correspondeIntencao(entrada, [
+    final entradaNatural = _resolverFormaPagamento(entrada) ??
+        (_correspondeIntencao(entrada, [
       'pix',
       'pagar no pix',
       'vou pagar no pix',
@@ -1522,7 +1594,7 @@ class BotService {
                     'pagar no debito',
                   ])
                     ? 'pag_debito'
-                    : entrada;
+                    : entrada);
     final opcao = _acharOpcaoSimples(entradaNatural, opcoes);
     if (opcao == null || !atuais.any((e) => e['id'] == opcao['id'])) {
       await _mostrarPagamentos(msg, config, dados);
@@ -2192,11 +2264,7 @@ class BotService {
     // Pedido confirmado encerra totalmente o carrinho anterior. Assim o próximo
     // pedido do mesmo telefone sempre nasce limpo e um segundo clique em um botão
     // antigo de confirmação não cria outro pedido.
-    _salvarInicioLimpo(
-      msg.telefone,
-      msg.nome,
-      boasVindasNaProximaMensagem: true,
-    );
+    _salvarInicioLimpo(msg.telefone, msg.nome);
 
     final mensagens =
         Map<String, dynamic>.from(config['mensagens'] as Map? ?? {});
@@ -2310,7 +2378,46 @@ class BotService {
     for (final item in lista) {
       if (_normalizar(item['nome'].toString()) == entrada) return item;
     }
-    return null;
+    return _acharOpcaoPorFrase(
+      entrada,
+      lista,
+      (item) => item['nome']?.toString() ?? '',
+    );
+  }
+
+  Map<String, dynamic>? _acharOpcaoPorFrase(
+    String entrada,
+    List<Map<String, dynamic>> opcoes,
+    String Function(Map<String, dynamic>) obterNome,
+  ) {
+    if (_contemTermo(entrada, ['nao', 'nunca', 'sem'])) return null;
+    final texto = ' ${_normalizar(entrada)} ';
+    final correspondencias = opcoes.where((opcao) {
+      final nome = _normalizar(obterNome(opcao));
+      return nome.isNotEmpty && texto.contains(' $nome ');
+    }).toList();
+    if (correspondencias.isEmpty) return null;
+
+    final nomes = correspondencias
+        .map((opcao) => _normalizar(obterNome(opcao)))
+        .toSet()
+        .toList();
+    for (var i = 0; i < nomes.length; i++) {
+      for (var j = i + 1; j < nomes.length; j++) {
+        if (!nomes[i].contains(nomes[j]) &&
+            !nomes[j].contains(nomes[i])) {
+          return null;
+        }
+      }
+    }
+
+    final tamanhoMaiorNome = correspondencias
+        .map((opcao) => _normalizar(obterNome(opcao)).length)
+        .reduce((a, b) => a > b ? a : b);
+    final maisEspecificas = correspondencias
+        .where((opcao) => _normalizar(obterNome(opcao)).length == tamanhoMaiorNome)
+        .toList();
+    return maisEspecificas.length == 1 ? maisEspecificas.single : null;
   }
 
   String _descricaoBase(Map<String, dynamic> cardapio) {
@@ -2318,24 +2425,6 @@ class BotService {
         cardapio['fluxoArrozAtivo'] == true ? 'arroz à escolha' : 'arroz';
     final feijao =
         cardapio['fluxoFeijaoAtivo'] == true ? 'feijão à escolha' : 'feijão';
-    return '$arroz + $feijao';
-  }
-
-  String _descricaoBaseEscolhida(
-    Map<String, dynamic> cardapio,
-    Map<String, dynamic> dados,
-  ) {
-    final item = Map<String, dynamic>.from(dados['itemAtual'] as Map? ?? {});
-    final arroz = cardapio['fluxoArrozAtivo'] == true
-        ? (item['arrozNome']?.toString().trim().isNotEmpty == true
-            ? item['arrozNome'].toString().trim()
-            : 'arroz à escolha')
-        : 'arroz';
-    final feijao = cardapio['fluxoFeijaoAtivo'] == true
-        ? (item['feijaoNome']?.toString().trim().isNotEmpty == true
-            ? item['feijaoNome'].toString().trim()
-            : 'feijão à escolha')
-        : 'feijão';
     return '$arroz + $feijao';
   }
 
@@ -2353,7 +2442,15 @@ class BotService {
     if (numero != null && numero >= 1 && numero <= opcoes.length) {
       return opcoes[numero - 1];
     }
-    return null;
+    final encontradas = _acharOpcaoPorFrase(
+      entrada,
+      opcoes.map((opcao) => Map<String, dynamic>.from(opcao)).toList(),
+      (opcao) => opcao['titulo']?.toString() ?? '',
+    );
+    if (encontradas == null) return null;
+    return opcoes.firstWhere(
+      (opcao) => opcao['id'] == encontradas['id'],
+    );
   }
 
   bool _pagamentoAtivo(Map<String, dynamic> config, String pagamento) {
@@ -2397,6 +2494,43 @@ class BotService {
   bool _corresponde(String entrada, List<String> opcoes) =>
       opcoes.any((o) => entrada == _normalizar(o));
 
+  bool _contemTermo(String entrada, List<String> termos) {
+    final texto = ' ${_normalizar(entrada)} ';
+    return termos.any((termo) =>
+        texto.contains(' ${_normalizar(termo)} '));
+  }
+
+  String? _resolverFormaRecebimento(String entrada) {
+    final texto = _normalizar(entrada);
+    if (_contemTermo(texto, ['nao', 'nunca', 'sem'])) return null;
+    final entrega = _contemTermo(
+      texto,
+      ['entrega', 'entregar', 'casa', 'em casa', 'domicilio', 'delivery'],
+    );
+    final retirada = _contemTermo(
+      texto,
+      ['retirada', 'retirar', 'buscar', 'busco', 'loja', 'balcao'],
+    );
+    if (entrega == retirada) return null;
+    return entrega ? 'rec_entrega' : 'rec_retirada';
+  }
+
+  String? _resolverFormaPagamento(String entrada) {
+    final texto = _normalizar(entrada);
+    if (_contemTermo(texto, ['nao', 'nunca', 'sem'])) return null;
+    final opcoes = <String, List<String>>{
+      'pag_pix': ['pix'],
+      'pag_dinheiro': ['dinheiro', 'cash'],
+      'pag_credito': ['credito'],
+      'pag_debito': ['debito'],
+    };
+    final encontradas = opcoes.entries
+        .where((opcao) => _contemTermo(texto, opcao.value))
+        .map((opcao) => opcao.key)
+        .toList();
+    return encontradas.length == 1 ? encontradas.single : null;
+  }
+
   bool _ehComandoCancelar(String entrada) => _correspondeIntencao(entrada, [
         '0',
         'cancelar',
@@ -2413,7 +2547,8 @@ class BotService {
         'conf_cancelar',
       ]);
 
-  bool _ehComandoHumano(String entrada) => _correspondeIntencao(entrada, [
+  bool _ehComandoHumano(String entrada) {
+    if (_correspondeIntencao(entrada, [
         'humano',
         'atendente',
         'inicio_humano',
@@ -2428,7 +2563,26 @@ class BotService {
         'quero falar com alguem',
         'preciso de um atendente',
         'preciso de ajuda humana',
-      ]);
+      ])) {
+      return true;
+    }
+    final texto = _normalizar(entrada);
+    return !_contemTermo(texto, ['nao', 'nunca', 'sem']) &&
+        _contemTermo(texto, ['atendente', 'humano', 'pessoa', 'alguem']) &&
+        _contemTermo(texto, [
+          'falar',
+          'conversar',
+          'chamar',
+          'chama',
+          'pode',
+          'posso',
+          'quero',
+          'queria',
+          'gostaria',
+          'preciso',
+          'atendimento',
+        ]);
+  }
 
   // Não usamos mais o número 9 como comando global. Quantidade pode ser 9 e
   // listas podem ter 9/10 opções. A palavra “voltar” não conflita com números.
