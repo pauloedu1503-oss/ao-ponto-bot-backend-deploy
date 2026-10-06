@@ -360,21 +360,28 @@ class Api {
 
   Response _bootstrap(Request _) => jsonResponse({
         'dashboard': banco.dashboard(),
-        'configuracao': banco.obterConfiguracao(),
+        'configuracao': _configuracaoPainel(),
         'cardapio': banco.obterCardapio(),
         'pedidos': banco.listarPedidos(limite: 50),
         'humanos': banco.listarSessoesHumanas(),
       });
 
   Response _dashboard(Request _) => jsonResponse(banco.dashboard());
-  Response _configGet(Request _) => jsonResponse(banco.obterConfiguracao());
+  Map<String, dynamic> _configuracaoPainel() => {
+        ...banco.obterConfiguracao(),
+        // Expõe apenas o status, nunca o segredo do provedor.
+        'iaConfigurada': bot.ia.configurado,
+      };
+
+  Response _configGet(Request _) => jsonResponse(_configuracaoPainel());
 
   Future<Response> _configPut(Request request) async {
     final body = await lerJson(request);
     final versao = (body['versao'] as num?)?.toInt() ?? -1;
     final dados = Map<String, dynamic>.from(body['dados'] as Map? ?? {});
     if (dados.isEmpty) throw const FormatException('Configuração vazia.');
-    return jsonResponse(banco.atualizarConfiguracao(dados, versao));
+    final atualizado = banco.atualizarConfiguracao(dados, versao);
+    return jsonResponse({...atualizado, 'iaConfigurada': bot.ia.configurado});
   }
 
   Response _cardapioGet(Request _) => jsonResponse(banco.obterCardapio());

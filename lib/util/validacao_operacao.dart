@@ -16,6 +16,9 @@ class ValidacaoOperacao {
     if (dados['botAtivo'] is! bool) {
       throw ArgumentError('O controle principal do bot está inválido.');
     }
+    if (!{'bot', 'ia'}.contains(dados['modoAtendimento'] ?? 'bot')) {
+      throw ArgumentError('Modo de atendimento inválido.');
+    }
     if (dados['entregaAtiva'] != true && dados['retiradaAtiva'] != true) {
       throw ArgumentError(
           'Configurações > Entrega e retirada: ative pelo menos uma opção.');

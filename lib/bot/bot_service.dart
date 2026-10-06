@@ -4,23 +4,49 @@ import '../banco/banco.dart';
 import '../modelos/mensagem_whatsapp.dart';
 import '../util/calculo_pedido.dart';
 import '../servicos/whatsapp_service.dart';
+import '../servicos/groq_atendimento_service.dart';
 import '../util/data_hora.dart';
 import '../util/estado_atendimento.dart';
 
 class BotService {
   final Banco banco;
   final WhatsAppService whatsapp;
+  final GroqAtendimentoService ia;
   Future<void> _fila = Future<void>.value();
 
-  BotService(this.banco, this.whatsapp);
+  BotService(this.banco, this.whatsapp, {GroqAtendimentoService? ia})
+      : ia = ia ?? GroqAtendimentoService();
 
   // Serializa as transições. Dentro da transação, WhatsApp apenas persiste a
   // saída; nenhum acesso de rede ocorre com a transação SQLite aberta.
   Future<void> processar(MensagemWhatsApp msg) {
     final atual = _fila.catchError((_) {}).then((_) async {
+      var mensagemProcessada = msg;
+      String? respostaIA;
+      try {
+        final interpretacao = await _interpretarComIA(msg);
+        if (interpretacao != null) {
+          if (interpretacao.tipo == 'escolha') {
+            mensagemProcessada = MensagemWhatsApp(
+              id: msg.id,
+              telefone: msg.telefone,
+              nome: msg.nome,
+              texto: interpretacao.texto,
+              enviadaEm: msg.enviadaEm,
+            );
+          } else {
+            respostaIA = interpretacao.texto;
+          }
+        }
+      } catch (e) {
+        // A IA é opcional: falha de rede/cota usa a entrada original no fluxo
+        // determinístico, sem deixar a mensagem presa na fila.
+        banco.log(
+            'WARN', 'ia_indisponivel_fallback_bot', e.runtimeType.toString());
+      }
       banco.db.execute('BEGIN IMMEDIATE');
       try {
-        await _processarInterno(msg);
+        await _processarInterno(mensagemProcessada, respostaIA: respostaIA);
         banco.db.execute('DELETE FROM webhook_entrada WHERE id = ?', [msg.id]);
         banco.db.execute('COMMIT');
       } catch (e) {
@@ -83,7 +109,235 @@ class BotService {
     );
   }
 
-  Future<void> _processarInterno(MensagemWhatsApp msg) async {
+  Future<InterpretacaoAtendimento?> _interpretarComIA(
+    MensagemWhatsApp msg,
+  ) async {
+    if (msg.respostaId != null || msg.entrada.isEmpty) return null;
+    final mensagensAnteriores = banco.db.select(
+      'SELECT status FROM mensagens_processadas WHERE id = ?',
+      [msg.id],
+    );
+    if (mensagensAnteriores.any((row) => row['status'] == 'done')) return null;
+    final wrapper = banco.obterConfiguracao();
+    final config = Map<String, dynamic>.from(wrapper['dados'] as Map);
+    if (config['modoAtendimento'] != 'ia' ||
+        config['botAtivo'] == false ||
+        _estadoEfetivo(config) != 'atendendo') {
+      return null;
+    }
+    final sessao = banco.obterSessao(msg.telefone);
+    if (sessao?['modoHumano'] == true || _sessaoExpirou(sessao, config)) {
+      return null;
+    }
+    if (const {'endereco', 'observacao'}.contains(sessao?['etapa'])) {
+      // Não enviar endereços nem observações livres dos clientes à IA.
+      return null;
+    }
+    final entrada = _normalizar(msg.entrada);
+    if (_ehComandoAjuda(entrada) ||
+        _ehComandoHumano(entrada) ||
+        _ehComandoCancelar(entrada) ||
+        _ehComandoVoltar(entrada) ||
+        _ehComandoCorrigir(entrada) ||
+        _resolverOpcaoInicio(entrada) != null ||
+        _contemTermo(entrada, ['cardapio', 'menu'])) {
+      return null;
+    }
+
+    final respostaEntrega = _responderDuvidaEntrega(msg.entrada, config);
+    if (respostaEntrega != null) {
+      return InterpretacaoAtendimento('duvida', respostaEntrega);
+    }
+    if (!ia.configurado) return null;
+
+    final cardapio = banco.obterCardapio();
+    final opcoesMenu = <String, dynamic>{};
+    for (final chave in [
+      'tamanhos',
+      'misturas',
+      'acompanhamentos',
+      'bebidas',
+      'arrozes',
+      'feijoes'
+    ]) {
+      opcoesMenu[chave] = (cardapio[chave] as List? ?? const [])
+          .where((item) => item is Map && item['ativo'] == true)
+          .map((item) => {
+                'nome': (item as Map)['nome'],
+                if (item['preco'] is num) 'preco': item['preco'],
+              })
+          .toList();
+    }
+    final pagamentos =
+        Map<String, dynamic>.from(config['pagamentos'] as Map? ?? {});
+    final etapa = sessao?['etapa']?.toString() ?? 'inicio';
+    final contexto = <String, dynamic>{
+      'estabelecimento': config['nomeEstabelecimento'],
+      'opcoesCardapio': opcoesMenu,
+      'entregaAtiva': config['entregaAtiva'] == true,
+      'retiradaAtiva': config['retiradaAtiva'] == true,
+      'cidadesAtendidas': const [
+        {'nome': 'Barra Bonita', 'uf': 'SP', 'taxa': 8.0},
+        {'nome': 'Igaraçu do Tietê', 'uf': 'SP', 'taxa': 10.0},
+      ],
+      'formasPagamento': pagamentos.entries
+          .where((entry) => entry.value == true)
+          .map((entry) => entry.key)
+          .toList(),
+      'enderecoRetirada': config['enderecoRetirada'],
+      'etapaAtual': etapa,
+      'opcoesDaEtapa': _opcoesEtapaIA(etapa, sessao, config),
+    };
+    return ia.interpretar(
+      mensagem: msg.entrada,
+      etapa: etapa,
+      contexto: contexto,
+    );
+  }
+
+  String? _responderDuvidaEntrega(
+    String mensagemOriginal,
+    Map<String, dynamic> config,
+  ) {
+    final texto = _normalizar(mensagemOriginal);
+    final perguntaTaxa = _contemTermo(texto, [
+      'taxa',
+      'taxas',
+      'cobra',
+      'cobram',
+      'custo',
+      'valor da entrega',
+      'preco da entrega',
+    ]);
+    final perguntaCidades = _contemTermo(texto, ['cidade', 'cidades']) &&
+        _contemTermo(texto, [
+          'atende',
+          'atendem',
+          'entrega',
+          'entregam',
+          'entregamos',
+        ]);
+    final perguntaEntrega = _contemTermo(
+            texto, ['entrega', 'entregam', 'entregar', 'delivery']) &&
+        (mensagemOriginal.contains('?') ||
+            RegExp(r'^(?:(?:voces|vcs|voce|vc)\s+)?(?:entregam|entrega|entregar|quanto|qual|onde)\b')
+                .hasMatch(texto));
+    if (!perguntaTaxa && !perguntaCidades && !perguntaEntrega) return null;
+
+    if (config['entregaAtiva'] != true) {
+      return 'No momento não estamos fazendo entregas.';
+    }
+
+    final barraBonita = RegExp(r'\bbarra bonita\b').hasMatch(texto);
+    final igaracu = RegExp(
+      r'\b(?:igaracu(?: do tiete)?|igaracu tiete)\b',
+    ).hasMatch(texto);
+    if (barraBonita) {
+      return perguntaTaxa
+          ? 'A taxa de entrega para Barra Bonita é R\$ 8,00.'
+          : 'Sim, entregamos em Barra Bonita. A taxa é R\$ 8,00.';
+    }
+    if (igaracu) {
+      return perguntaTaxa
+          ? 'A taxa de entrega para Igaraçu do Tietê é R\$ 10,00.'
+          : 'Sim, entregamos em Igaraçu do Tietê. A taxa é R\$ 10,00.';
+    }
+
+    return 'Atendemos somente em Barra Bonita e Igaraçu do Tietê. A taxa é R\$ 8,00 para Barra Bonita e R\$ 10,00 para Igaraçu do Tietê.';
+  }
+
+  List<Map<String, String>> _opcoesEtapaIA(
+    String etapa,
+    Map<String, dynamic>? sessao,
+    Map<String, dynamic> config,
+  ) {
+    if (etapa == 'inicio') {
+      return _botoesInicio()
+          .map((item) => {'valor': item['id']!, 'nome': item['titulo']!})
+          .toList();
+    }
+    if (etapa == 'confirmacao') {
+      return const [
+        {'valor': 'conf_confirmar', 'nome': 'Confirmar pedido'},
+        {'valor': 'conf_refazer', 'nome': 'Refazer pedido'},
+        {'valor': 'conf_cancelar', 'nome': 'Cancelar pedido'},
+      ];
+    }
+    if (etapa == 'confirmar_cancelamento') {
+      return const [
+        {'valor': 'cancelar_sim', 'nome': 'Sim, cancelar'},
+        {'valor': 'cancelar_nao', 'nome': 'Continuar pedido'},
+      ];
+    }
+    if (etapa == 'adicionar_outro') {
+      return const [
+        {'valor': 'outro_sim', 'nome': 'Adicionar outra marmita'},
+        {'valor': 'outro_nao', 'nome': 'Finalizar pedido'},
+      ];
+    }
+    if (etapa == 'adicionar_outra_bebida') {
+      return const [
+        {'valor': 'beb_outra', 'nome': 'Adicionar outra bebida'},
+        {'valor': 'beb_finalizar', 'nome': 'Finalizar bebidas'},
+      ];
+    }
+
+    final dados = Map<String, dynamic>.from(sessao?['dados'] as Map? ?? {});
+    final List<dynamic> exibidas = switch (etapa) {
+      'recebimento' => dados['recebimentosExibidos'] as List? ?? const [],
+      'pagamento' => dados['pagamentosExibidos'] as List? ?? const [],
+      'cidade_entrega' => dados['cidadesExibidas'] as List? ?? const [],
+      'tamanho' ||
+      'arroz' ||
+      'feijao' ||
+      'mistura' ||
+      'acompanhamento' ||
+      'bebida' =>
+        dados['opcoesExibidas'] as List? ?? const [],
+      _ => const [],
+    };
+    final prefixo = switch (etapa) {
+      'tamanho' => 'tam:',
+      'arroz' => 'arr:',
+      'feijao' => 'fei:',
+      'mistura' => 'mis:',
+      'acompanhamento' => 'aco:',
+      'bebida' => 'beb:',
+      'cidade_entrega' => 'cid:',
+      _ => '',
+    };
+    final opcoes = exibidas
+        .whereType<Map>()
+        .map((item) {
+          final id = item['id']?.toString() ?? '';
+          final nome = (item['titulo'] ?? item['nome'] ?? '').toString();
+          return {
+            'valor':
+                prefixo.isEmpty || id.startsWith(prefixo) ? id : '$prefixo$id',
+            'nome': nome,
+          };
+        })
+        .where((item) => item['valor']!.isNotEmpty && item['nome']!.isNotEmpty)
+        .toList();
+    if (etapa == 'bebida') {
+      opcoes.add({'valor': 'beb_sem', 'nome': 'Sem bebida'});
+    } else if (etapa == 'troco') {
+      opcoes.add({'valor': 'não', 'nome': 'Sem troco'});
+      opcoes
+          .add({'valor': 'valor numérico', 'nome': 'Informar valor do troco'});
+    }
+    if (etapa == 'pagamento' && opcoes.isEmpty) {
+      return _opcoesPagamento(config)
+          .map((item) => {'valor': item['id']!, 'nome': item['titulo']!})
+          .toList();
+    }
+    return opcoes;
+  }
+
+  Future<void> _processarInterno(
+    MensagemWhatsApp msg, {
+    String? respostaIA,
+  }) async {
     if (!banco.iniciarProcessamentoMensagem(msg.id)) return;
     try {
       final configWrapper = banco.obterConfiguracao();
@@ -140,21 +394,50 @@ class BotService {
       }
 
       final expirou = _sessaoExpirou(sessao, config);
-      final pedidoEmAndamentoExpirou = expirou &&
-          sessao != null &&
-          sessao['etapa']?.toString() != 'inicio';
+      final pedidoEmAndamentoExpirou =
+          expirou && sessao != null && sessao['etapa']?.toString() != 'inicio';
       if (expirou) {
         banco.excluirSessao(msg.telefone);
         sessao = null;
       }
       final entrada = _normalizar(msg.entrada);
-      if (sessao?['etapa'] == 'confirmar_cancelamento') {
-        await _tratarConfirmarCancelamento(msg, sessao!, entrada);
+      if (_ehComandoAjuda(entrada)) {
+        await _responderAjuda(msg, sessao);
         banco.finalizarMensagem(msg.id);
         return;
       }
-      if (_ehComandoAjuda(entrada)) {
-        await _responderAjuda(msg, sessao);
+
+      if (respostaIA != null) {
+        final dados = Map<String, dynamic>.from(sessao?['dados'] as Map? ?? {});
+        dados.putIfAbsent('clienteNome', () => msg.nome);
+        dados.putIfAbsent('itens', () => <dynamic>[]);
+        banco.salvarSessao(
+          telefone: msg.telefone,
+          nome: msg.nome,
+          etapa: sessao?['etapa']?.toString() ?? 'inicio',
+          dados: dados,
+        );
+        final mensagens =
+            Map<String, dynamic>.from(config['mensagens'] as Map? ?? {});
+        final boasVindas = sessao == null
+            ? '${mensagens['boasVindas'] ?? 'Olá! Bem-vindo à ${config['nomeEstabelecimento']}.'}\n\n'
+            : '';
+        await whatsapp.enviarTexto(msg.telefone, '$boasVindas$respostaIA');
+        banco.finalizarMensagem(msg.id);
+        return;
+      }
+      if (_ehComandoHumano(entrada)) {
+        banco.definirModoHumano(msg.telefone, true);
+        await whatsapp.enviarTexto(
+          msg.telefone,
+          _textoFluxo('sistema', 'humanoAtivado',
+              'Certo! 👤 O atendimento automático foi pausado para esta conversa. Um atendente continuará por aqui.'),
+        );
+        banco.finalizarMensagem(msg.id);
+        return;
+      }
+      if (sessao?['etapa'] == 'confirmar_cancelamento') {
+        await _tratarConfirmarCancelamento(msg, sessao!, entrada);
         banco.finalizarMensagem(msg.id);
         return;
       }
@@ -168,17 +451,6 @@ class BotService {
             _botoesInicio(),
           );
         }
-        banco.finalizarMensagem(msg.id);
-        return;
-      }
-
-      if (_ehComandoHumano(entrada)) {
-        banco.definirModoHumano(msg.telefone, true);
-        await whatsapp.enviarTexto(
-          msg.telefone,
-          _textoFluxo('sistema', 'humanoAtivado',
-              'Certo! 👤 O atendimento automático foi pausado para esta conversa. Um atendente continuará por aqui.'),
-        );
         banco.finalizarMensagem(msg.id);
         return;
       }
@@ -535,7 +807,28 @@ class BotService {
     Map<String, dynamic> dados,
     String entrada,
   ) async {
-    entrada = _resolverOpcaoInicio(entrada) ?? _normalizar(entrada);
+    final opcoesAposCardapio = dados['opcoesInicioAposCardapio'] == true;
+    final entradaNormalizada = _normalizar(entrada);
+    if (opcoesAposCardapio && entradaNormalizada == '2') {
+      // Após o cardápio, a segunda opção exibida é falar com atendente.
+      // O atalho global "2 = cardápio" não deve prevalecer sobre essa lista.
+      entrada = 'inicio_humano';
+    } else {
+      entrada = _resolverOpcaoInicio(entrada) ?? entradaNormalizada;
+    }
+
+    if (entrada == 'inicio_cardapio') {
+      dados['opcoesInicioAposCardapio'] = true;
+    } else {
+      dados.remove('opcoesInicioAposCardapio');
+    }
+    banco.salvarSessao(
+      telefone: msg.telefone,
+      nome: msg.nome,
+      etapa: 'inicio',
+      dados: dados,
+    );
+
     if (_corresponde(entrada, [
       'inicio_pedido',
       '1',
@@ -582,10 +875,8 @@ class BotService {
   }
 
   Future<void> _mostrarCardapio(
-    MensagemWhatsApp msg,
-    Map<String, dynamic> config,
-    {bool incluirBotoes = true}
-  ) async {
+      MensagemWhatsApp msg, Map<String, dynamic> config,
+      {bool incluirBotoes = true}) async {
     final c = banco.obterCardapio();
     final tamanhos = (c['tamanhos'] as List)
         .where((e) => (e as Map)['ativo'] == true)
@@ -672,15 +963,15 @@ class BotService {
       return;
     }
     await whatsapp.enviarBotoes(msg.telefone, texto, [
-        {
-          'id': 'inicio_pedido',
-          'titulo': _textoFluxo('inicio', 'botaoPedido', 'Fazer pedido')
-        },
-        {
-          'id': 'inicio_humano',
-          'titulo': _textoFluxo('inicio', 'botaoHumano', 'Falar atendente')
-        },
-      ]);
+      {
+        'id': 'inicio_pedido',
+        'titulo': _textoFluxo('inicio', 'botaoPedido', 'Fazer pedido')
+      },
+      {
+        'id': 'inicio_humano',
+        'titulo': _textoFluxo('inicio', 'botaoHumano', 'Falar atendente')
+      },
+    ]);
   }
 
   Future<void> _mostrarTamanhos(
@@ -1061,27 +1352,36 @@ class BotService {
     Map<String, dynamic> dados,
     String entrada,
   ) async {
-    if (_corresponde(entrada, [
-      'outro_sim',
-      '1',
-      'sim',
-      'adicionar outra',
-      _textoFluxo('adicionarOutro', 'botaoSim', 'Adicionar outra')
-    ])) {
+    if (_ehConfirmacaoOpcional(entrada) ||
+        _corresponde(entrada, [
+          'outro_sim',
+          '1',
+          'sim',
+          's',
+          'claro',
+          'mais uma',
+          'quero outra',
+          'quero mais uma',
+          'adicionar mais uma',
+          'adicionar outra',
+          _textoFluxo('adicionarOutro', 'botaoSim', 'Adicionar outra')
+        ])) {
       await _mostrarTamanhos(msg, dados);
       return;
     }
-    if (_corresponde(
-      entrada,
-      [
-        'outro_nao',
-        '2',
-        'nao',
-        'não',
-        'finalizar pedido',
-        _textoFluxo('adicionarOutro', 'botaoNao', 'Finalizar pedido')
-      ],
-    )) {
+    if (_ehNegacaoOpcional(entrada) ||
+        _corresponde(
+          entrada,
+          [
+            'outro_nao',
+            '2',
+            'nao',
+            'não',
+            'n',
+            'finalizar pedido',
+            _textoFluxo('adicionarOutro', 'botaoNao', 'Finalizar pedido')
+          ],
+        )) {
       await _mostrarRecebimento(msg, config, dados);
       return;
     }
@@ -1152,24 +1452,24 @@ class BotService {
         .toList();
     final entradaNatural = _resolverFormaRecebimento(entrada) ??
         (_correspondeIntencao(entrada, [
-      'entrega',
-      'entregar',
-      'quero entrega',
-      'manda entregar',
-      'pode entregar',
-      'receber em casa',
-    ])
-        ? 'rec_entrega'
-        : _correspondeIntencao(entrada, [
-            'retirada',
-            'retirar',
-            'quero retirar',
-            'vou retirar',
-            'vou buscar',
-            'buscar no local',
-          ])
-            ? 'rec_retirada'
-            : entrada);
+          'entrega',
+          'entregar',
+          'quero entrega',
+          'manda entregar',
+          'pode entregar',
+          'receber em casa',
+        ])
+            ? 'rec_entrega'
+            : _correspondeIntencao(entrada, [
+                'retirada',
+                'retirar',
+                'quero retirar',
+                'vou retirar',
+                'vou buscar',
+                'buscar no local',
+              ])
+                ? 'rec_retirada'
+                : entrada);
     final opcao = _acharOpcaoSimples(entradaNatural, opcoes);
     if (opcao == null || !atuais.any((e) => e['id'] == opcao['id'])) {
       await _mostrarRecebimento(msg, config, dados);
@@ -1571,31 +1871,31 @@ class BotService {
         .toList();
     final entradaNatural = _resolverFormaPagamento(entrada) ??
         (_correspondeIntencao(entrada, [
-      'pix',
-      'pagar no pix',
-      'vou pagar no pix',
-    ])
-        ? 'pag_pix'
-        : _correspondeIntencao(entrada, [
-            'dinheiro',
-            'pagar em dinheiro',
-            'vou pagar em dinheiro',
-          ])
-            ? 'pag_dinheiro'
+          'pix',
+          'pagar no pix',
+          'vou pagar no pix',
+        ])
+            ? 'pag_pix'
             : _correspondeIntencao(entrada, [
-                'credito',
-                'cartao de credito',
-                'pagar no credito',
-                'pag_cartao',
+                'dinheiro',
+                'pagar em dinheiro',
+                'vou pagar em dinheiro',
               ])
-                ? 'pag_credito'
+                ? 'pag_dinheiro'
                 : _correspondeIntencao(entrada, [
-                    'debito',
-                    'cartao de debito',
-                    'pagar no debito',
+                    'credito',
+                    'cartao de credito',
+                    'pagar no credito',
+                    'pag_cartao',
                   ])
-                    ? 'pag_debito'
-                    : entrada);
+                    ? 'pag_credito'
+                    : _correspondeIntencao(entrada, [
+                        'debito',
+                        'cartao de debito',
+                        'pagar no debito',
+                      ])
+                        ? 'pag_debito'
+                        : entrada);
     final opcao = _acharOpcaoSimples(entradaNatural, opcoes);
     if (opcao == null || !atuais.any((e) => e['id'] == opcao['id'])) {
       await _mostrarPagamentos(msg, config, dados);
@@ -1648,15 +1948,16 @@ class BotService {
     Map<String, dynamic> dados,
     String entrada,
   ) async {
-    if (_corresponde(entrada, [
-      'nao',
-      'não',
-      'n',
-      'sem troco',
-      'nao precisa',
-      'nao preciso',
-      _textoFluxo('troco', 'textoSemTroco', 'não')
-    ])) {
+    if (_ehNegacaoOpcional(entrada) ||
+        _corresponde(entrada, [
+          'nao',
+          'não',
+          'n',
+          'sem troco',
+          'nao precisa',
+          'nao preciso',
+          _textoFluxo('troco', 'textoSemTroco', 'não')
+        ])) {
       dados['trocoPara'] = null;
       await _irParaObservacaoOuResumo(msg, config, dados);
       return;
@@ -1735,6 +2036,18 @@ class BotService {
         'nada',
         'sem nada',
         'nao tenho',
+        'n tenho',
+        'n quero',
+        'nao quero',
+        'nao preciso',
+        'n preciso',
+        'nao obrigado',
+        'nao obrigada',
+        'nao valeu',
+        'dispenso',
+        'deixa',
+        'pode deixar',
+        'sem',
         'sem observacao',
         'sem observação',
         _textoFluxo('observacao', 'textoNenhuma', 'não')
@@ -1827,13 +2140,15 @@ class BotService {
     Map<String, dynamic> dados,
     String entrada,
   ) async {
-    if (_corresponde(entrada, [
-      'beb_sem',
-      'sem bebida',
-      'nao',
-      'não',
-      _textoFluxo('bebida', 'botaoSemBebida', 'Sem bebida'),
-    ])) {
+    if (_ehNegacaoOpcional(entrada) ||
+        _corresponde(entrada, [
+          'beb_sem',
+          'sem bebida',
+          'nao',
+          'não',
+          'n',
+          _textoFluxo('bebida', 'botaoSemBebida', 'Sem bebida'),
+        ])) {
       await _mostrarResumo(msg, config, dados);
       return;
     }
@@ -1929,22 +2244,31 @@ class BotService {
     Map<String, dynamic> dados,
     String entrada,
   ) async {
-    if (_corresponde(entrada, [
-      'beb_outra',
-      '1',
-      'sim',
-      _textoFluxo('adicionarOutraBebida', 'botaoSim', 'Adicionar outra'),
-    ])) {
+    if (_ehConfirmacaoOpcional(entrada) ||
+        _corresponde(entrada, [
+          'beb_outra',
+          '1',
+          'sim',
+          's',
+          'claro',
+          'mais uma',
+          'quero outra',
+          'quero mais uma',
+          'adicionar mais uma',
+          _textoFluxo('adicionarOutraBebida', 'botaoSim', 'Adicionar outra'),
+        ])) {
       await _mostrarBebidas(msg, dados);
       return;
     }
-    if (_corresponde(entrada, [
-      'beb_finalizar',
-      '2',
-      'nao',
-      'não',
-      _textoFluxo('adicionarOutraBebida', 'botaoNao', 'Finalizar bebidas'),
-    ])) {
+    if (_ehNegacaoOpcional(entrada) ||
+        _corresponde(entrada, [
+          'beb_finalizar',
+          '2',
+          'nao',
+          'não',
+          'n',
+          _textoFluxo('adicionarOutraBebida', 'botaoNao', 'Finalizar bebidas'),
+        ])) {
       await _mostrarResumo(msg, config, dados);
       return;
     }
@@ -2405,8 +2729,7 @@ class BotService {
         .toList();
     for (var i = 0; i < nomes.length; i++) {
       for (var j = i + 1; j < nomes.length; j++) {
-        if (!nomes[i].contains(nomes[j]) &&
-            !nomes[j].contains(nomes[i])) {
+        if (!nomes[i].contains(nomes[j]) && !nomes[j].contains(nomes[i])) {
           return null;
         }
       }
@@ -2416,7 +2739,8 @@ class BotService {
         .map((opcao) => _normalizar(obterNome(opcao)).length)
         .reduce((a, b) => a > b ? a : b);
     final maisEspecificas = correspondencias
-        .where((opcao) => _normalizar(obterNome(opcao)).length == tamanhoMaiorNome)
+        .where(
+            (opcao) => _normalizar(obterNome(opcao)).length == tamanhoMaiorNome)
         .toList();
     return maisEspecificas.length == 1 ? maisEspecificas.single : null;
   }
@@ -2495,10 +2819,97 @@ class BotService {
   bool _corresponde(String entrada, List<String> opcoes) =>
       opcoes.any((o) => entrada == _normalizar(o));
 
+  bool _ehNegacaoOpcional(String entrada) {
+    final texto = _normalizar(entrada);
+    if (_corresponde(texto, [
+      'n',
+      'nao',
+      'nenhum',
+      'nenhuma',
+      'nada',
+      'sem',
+      'sem bebida',
+      'sem bebidas',
+      'sem nenhuma bebida',
+      'nenhuma bebida',
+      'nenhum bebida',
+      'dispenso',
+      'dispensar',
+      'passo',
+      'pode deixar',
+      'deixa',
+      'deixa pra la',
+      'sem necessidade',
+      'nada pra mim',
+      'nada para mim',
+      'nao obrigado',
+      'nao obrigada',
+      'nao valeu',
+      'valeu nao',
+      'quero nao',
+      'nao tenho interesse',
+      'nao quero bebida',
+      'nao quero bebidas',
+      'nao quero nenhuma bebida',
+      'nao quero mais bebida',
+      'nao quero outra bebida',
+      'nao quero adicionar bebida',
+      'n quero bebida',
+      'n quero bebidas',
+      'n quero nenhuma bebida',
+      'n quero mais bebida',
+      'n quero outra bebida',
+      'n quero mais nada',
+      'nao quero mais nada',
+      'n preciso de bebida',
+      'nao preciso de bebida',
+      'n precisa de bebida',
+      'nao precisa de bebida',
+      'n quero adicionar outra',
+      'nao quero adicionar outra',
+      'nao quero outra marmita',
+      'n quero outra marmita',
+      'nao vou querer bebida',
+    ])) {
+      return true;
+    }
+    return RegExp(
+      r'^(?:nao|n)\s+(?:quero|queria|preciso|precisa|vou querer)(?:\s+(?:mais|outra|outro|nenhuma|nenhum|nada|bebida|bebidas|marmita|marmitas|troco|adicionar(?:\s+(?:mais|outra|outras|bebida))?))?$',
+    ).hasMatch(texto);
+  }
+
+  bool _ehConfirmacaoOpcional(String entrada) {
+    final texto =
+        _normalizar(entrada).replaceFirst(RegExp(r'^(?:eu|por favor) '), '');
+    if (_ehNegacaoOpcional(texto)) return false;
+    if (_contemTermo(texto, ['nao', 'nunca'])) return false;
+    if (_corresponde(texto, [
+      'sim',
+      's',
+      'claro',
+      'com certeza',
+      'quero',
+      'quero sim',
+      'pode',
+      'pode ser',
+      'manda',
+      'adiciona',
+      'adicionar',
+      'mais uma',
+      'quero outra',
+      'quero mais uma',
+      'adicionar mais uma',
+    ])) {
+      return true;
+    }
+    return RegExp(
+      r'^(?:sim|claro|com certeza)(?:\s|$)|^(?:quero|queria|gostaria)\s+(?:sim|mais|outra|outro|adicionar|uma|um)\b|^(?:pode|manda|adiciona|adicionar)\s+(?:ser|sim|mais|outra|outro|uma|um|adicionar)\b',
+    ).hasMatch(texto);
+  }
+
   bool _contemTermo(String entrada, List<String> termos) {
     final texto = ' ${_normalizar(entrada)} ';
-    return termos.any((termo) =>
-        texto.contains(' ${_normalizar(termo)} '));
+    return termos.any((termo) => texto.contains(' ${_normalizar(termo)} '));
   }
 
   String? _resolverFormaRecebimento(String entrada) {
@@ -2550,21 +2961,21 @@ class BotService {
 
   bool _ehComandoHumano(String entrada) {
     if (_correspondeIntencao(entrada, [
-        'humano',
-        'atendente',
-        'inicio_humano',
-        'falar com atendente',
-        'falar com um atendente',
-        'quero falar com atendente',
-        'quero falar com um atendente',
-        'chamar atendente',
-        'chama atendente',
-        'atendimento humano',
-        'falar com alguem',
-        'quero falar com alguem',
-        'preciso de um atendente',
-        'preciso de ajuda humana',
-      ])) {
+      'humano',
+      'atendente',
+      'inicio_humano',
+      'falar com atendente',
+      'falar com um atendente',
+      'quero falar com atendente',
+      'quero falar com um atendente',
+      'chamar atendente',
+      'chama atendente',
+      'atendimento humano',
+      'falar com alguem',
+      'quero falar com alguem',
+      'preciso de um atendente',
+      'preciso de ajuda humana',
+    ])) {
       return true;
     }
     final texto = _normalizar(entrada);
@@ -2660,6 +3071,9 @@ class BotService {
       'sim cancelar',
       'confirmar cancelamento',
       'pode cancelar',
+      'cancelar',
+      'cancela',
+      '0',
     ]);
     final continuou = _correspondeIntencao(entrada, [
       'cancelar_nao',
@@ -2668,6 +3082,9 @@ class BotService {
       'continuar',
       'nao cancelar',
       'manter pedido',
+      'voltar',
+      'volta',
+      'volte',
     ]);
 
     if (confirmou) {
@@ -2734,6 +3151,8 @@ class BotService {
         'Escolha adicionar outra bebida ou finalizar as bebidas.',
       'confirmacao' =>
         'Confira o resumo e escolha confirmar, refazer ou cancelar.',
+      'confirmar_cancelamento' =>
+        'Escolha se deseja confirmar o cancelamento ou continuar o pedido.',
       _ => 'Escolha uma das opções exibidas para começar.',
     };
     await whatsapp.enviarTexto(

@@ -251,6 +251,7 @@ class Banco {
       final config = <String, dynamic>{
         'nomeEstabelecimento': 'Ao Ponto Marmitaria',
         'botAtivo': true,
+        'modoAtendimento': 'bot',
         'estadoBot': 'fechado',
         'usarHorarioAutomatico': false,
         'horarios': {
