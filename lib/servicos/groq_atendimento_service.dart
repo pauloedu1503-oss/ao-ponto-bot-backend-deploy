@@ -42,6 +42,8 @@ class GroqAtendimentoService {
             'model': modelo,
             'temperature': 0.2,
             'max_completion_tokens': 180,
+            // GPT-OSS exige reasoning_format hidden ou parsed quando usa JSON.
+            'reasoning_format': 'hidden',
             'response_format': {'type': 'json_object'},
             'messages': [
               {
