@@ -40,7 +40,6 @@ class GroqAtendimentoService {
           },
           body: jsonEncode({
             'model': modelo,
-            'temperature': 0.2,
             'max_completion_tokens': 180,
             // GPT-OSS exige reasoning_format hidden ou parsed quando usa JSON.
             'reasoning_format': 'hidden',
@@ -69,7 +68,7 @@ Use tipo duvida quando o cliente fizer uma pergunta ou não der uma resposta cla
         .timeout(const Duration(seconds: 8));
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw HttpExceptionSeguro('Groq HTTP ${response.statusCode}');
+      throw HttpExceptionSeguro(_resumoErroSeguro(response));
     }
     final envelope = jsonDecode(response.body) as Map<String, dynamic>;
     final choices = envelope['choices'];
@@ -95,6 +94,40 @@ Use tipo duvida quando o cliente fizer uma pergunta ou não der uma resposta cla
   }
 
   void fechar() => _client.close();
+
+  String _resumoErroSeguro(http.Response response) {
+    final partes = <String>['Groq HTTP ${response.statusCode}'];
+    try {
+      final envelope = jsonDecode(response.body);
+      final erro = envelope is Map ? envelope['error'] : null;
+      if (erro is Map) {
+        for (final campo in ['code', 'type', 'param']) {
+          final valor = erro[campo]?.toString();
+          if (valor != null &&
+              valor.isNotEmpty &&
+              RegExp(r'^[A-Za-z0-9_.-]{1,80}$').hasMatch(valor)) {
+            partes.add('$campo=$valor');
+          }
+        }
+        // Include only a short provider message after removing likely secrets
+        // and customer content. Never log the raw response or request body.
+        final mensagem = erro['message']?.toString();
+        if (mensagem != null && mensagem.isNotEmpty) {
+          var segura = mensagem
+              .replaceAll(RegExp(r'Bearer\s+\S+', caseSensitive: false),
+                  'Bearer [redacted]')
+              .replaceAll(RegExp(r'(?i)gsk_[A-Za-z0-9_-]+'), '[redacted]')
+              .replaceAll(RegExp(r'[\r\n\t]+'), ' ')
+              .trim();
+          if (segura.length > 180) segura = '${segura.substring(0, 180)}…';
+          partes.add('mensagem=$segura');
+        }
+      }
+    } catch (_) {
+      // Keep the status when the provider response is not valid JSON.
+    }
+    return partes.join(': ');
+  }
 }
 
 class HttpExceptionSeguro implements Exception {
