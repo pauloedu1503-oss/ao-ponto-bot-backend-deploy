@@ -41,8 +41,9 @@ class BotService {
       } catch (e) {
         // A IA é opcional: falha de rede/cota usa a entrada original no fluxo
         // determinístico, sem deixar a mensagem presa na fila.
-        banco.log(
-            'WARN', 'ia_indisponivel_fallback_bot', e.runtimeType.toString());
+        final detalhe =
+            e is HttpExceptionSeguro ? e.message : e.runtimeType.toString();
+        banco.log('WARN', 'ia_indisponivel_fallback_bot', detalhe);
       }
       banco.db.execute('BEGIN IMMEDIATE');
       try {
