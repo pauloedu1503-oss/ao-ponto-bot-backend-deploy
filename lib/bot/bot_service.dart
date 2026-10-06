@@ -25,20 +25,35 @@ class BotService {
       String? respostaIA;
       Map<String, dynamic>? pedidoIA;
       try {
-        final interpretacao = await _interpretarComIA(msg);
-        if (interpretacao != null) {
-          if (interpretacao.tipo == 'pedido') {
-            pedidoIA = interpretacao.pedido;
-          } else if (interpretacao.tipo == 'escolha') {
-            mensagemProcessada = MensagemWhatsApp(
-              id: msg.id,
-              telefone: msg.telefone,
-              nome: msg.nome,
-              texto: interpretacao.texto,
-              enviadaEm: msg.enviadaEm,
-            );
-          } else if (!_textoIaRepeteCliente(interpretacao.texto, msg.entrada)) {
-            respostaIA = interpretacao.texto;
+        final sessaoAtual = banco.obterSessao(msg.telefone);
+        final bebidaNoResumo = _modoIaAtivo &&
+                sessaoAtual?['etapa'] == 'confirmacao' &&
+                !_sessaoExpirou(
+                  sessaoAtual,
+                  Map<String, dynamic>.from(
+                      banco.obterConfiguracao()['dados'] as Map),
+                )
+            ? _capturarBebidaAdicional(msg.entrada)
+            : null;
+        if (bebidaNoResumo != null) {
+          pedidoIA = {'_adicionarBebidaResumo': bebidaNoResumo};
+        } else {
+          final interpretacao = await _interpretarComIA(msg);
+          if (interpretacao != null) {
+            if (interpretacao.tipo == 'pedido') {
+              pedidoIA = interpretacao.pedido;
+            } else if (interpretacao.tipo == 'escolha') {
+              mensagemProcessada = MensagemWhatsApp(
+                id: msg.id,
+                telefone: msg.telefone,
+                nome: msg.nome,
+                texto: interpretacao.texto,
+                enviadaEm: msg.enviadaEm,
+              );
+            } else if (!_textoIaRepeteCliente(
+                interpretacao.texto, msg.entrada)) {
+              respostaIA = interpretacao.texto;
+            }
           }
         }
       } catch (e) {
@@ -150,6 +165,11 @@ class BotService {
         _ehSolicitacaoCardapio(entrada) ||
         RegExp(r'^[\s?!.…]+$').hasMatch(msg.entrada)) {
       return null;
+    }
+    if (sessao?['etapa']?.toString() == 'ia_pedido' &&
+        (_ehPararDeAdicionarMarmitas(entrada) ||
+            RegExp(r'^e so essa(s)?$').hasMatch(entrada))) {
+      return const InterpretacaoAtendimento('escolha', 'so essa');
     }
     final respostaConhecida = _responderPerguntaConhecida(
       entrada,
@@ -701,11 +721,31 @@ class BotService {
       });
     }
     if (rascunhoAnterior.isNotEmpty) {
-      // The saved draft also contains incomplete later combinations. Prefer
-      // it as the canonical order list so completed rows don't hide them.
-      itens
-        ..clear()
-        ..addAll(rascunhoAnterior);
+      if (itens.isEmpty) {
+        itens.addAll(rascunhoAnterior);
+      } else {
+        String chave(Map<String, dynamic> linha) => [
+              _normalizar(linha['tamanho']?.toString() ?? ''),
+              _normalizar(linha['mistura']?.toString() ?? ''),
+              _normalizar(linha['acompanhamento']?.toString() ?? ''),
+              _normalizar(linha['arroz']?.toString() ?? ''),
+              _normalizar(linha['feijao']?.toString() ?? ''),
+            ].join('|');
+        final presentes = itens.map(chave).toSet();
+        for (final linha in rascunhoAnterior) {
+          if (_rascunhoItemCompleto(
+            Map<String, dynamic>.from(linha),
+            arrozAtivo: cardapio['fluxoArrozAtivo'] == true,
+            feijaoAtivo: cardapio['fluxoFeijaoAtivo'] == true,
+          )) {
+            continue;
+          }
+          if (presentes.add(chave(linha))) itens.add(linha);
+        }
+      }
+      for (var i = 0; i < itens.length; i++) {
+        itens[i]['indice'] = i + 1;
+      }
     }
     final totalSolicitado = _extrairTotalMarmitas(msg.entrada);
     if (totalSolicitado != null) {
@@ -883,46 +923,58 @@ class BotService {
             ? 'Quais tamanhos você prefere para as $totalMarmitas marmitas?'
             : itens.length == 1
                 ? 'Qual tamanho você prefere para sua marmita?'
-                : 'Qual tamanho você prefere para a marmita $n?';
+                : 'Qual tamanho você prefere para a próxima marmita?';
         perguntaPendente = _perguntaOpcaoIA(
           pergunta,
           _itensAtivos(cardapio, 'tamanhos'),
           'tamanho',
         );
       } else if (arrozAtivo && arroz == null) {
-        final referencia =
-            itens.length == 1 ? 'na sua marmita' : 'na marmita $n';
+        final referencia = _referenciaMarmitaIa(
+          itens,
+          i,
+          totalSolicitado: rascunho['quantidadeTotalSolicitada'] as num?,
+        );
         perguntaPendente = _perguntaOpcaoIA(
           'Qual arroz você prefere $referencia?',
           _itensAtivos(cardapio, 'arrozes'),
           'arroz',
         );
       } else if (feijaoAtivo && feijao == null) {
-        final referencia =
-            itens.length == 1 ? 'na sua marmita' : 'na marmita $n';
+        final referencia = _referenciaMarmitaIa(
+          itens,
+          i,
+          totalSolicitado: rascunho['quantidadeTotalSolicitada'] as num?,
+        );
         perguntaPendente = _perguntaOpcaoIA(
           'Qual feijão você prefere $referencia?',
           _itensAtivos(cardapio, 'feijoes'),
           'feijão',
         );
       } else if (mistura == null) {
-        final referencia =
-            itens.length == 1 ? 'na sua marmita' : 'na marmita $n';
+        final referencia = _referenciaMarmitaIa(
+          itens,
+          i,
+          totalSolicitado: rascunho['quantidadeTotalSolicitada'] as num?,
+        );
         perguntaPendente = _perguntaOpcaoIA(
           'Qual mistura você prefere $referencia?',
           _itensAtivos(cardapio, 'misturas'),
           'mistura',
         );
       } else if (acompanhamento == null) {
-        final referencia =
-            itens.length == 1 ? 'na sua marmita' : 'na marmita $n';
+        final referencia = _referenciaMarmitaIa(
+          itens,
+          i,
+          totalSolicitado: rascunho['quantidadeTotalSolicitada'] as num?,
+        );
         perguntaPendente = _perguntaOpcaoIA(
           'Qual acompanhamento você prefere $referencia?',
           _itensAtivos(cardapio, 'acompanhamentos'),
           'acompanhamento',
         );
       } else if (quantidade == null) {
-        perguntaPendente = 'Quantas marmitas iguais à $nª combinação?';
+        perguntaPendente = 'Quantas marmitas iguais a essa você gostaria?';
       }
       if (perguntaPendente != null) break;
       if (tamanho == null ||
@@ -1043,36 +1095,56 @@ class BotService {
   ) {
     final procurada = _limparRespostaOpcao(entrada?.toString() ?? '');
     if (procurada.isEmpty) return null;
+    if (_ehPerguntaExplicita(entrada?.toString() ?? '') ||
+        _contemTermo(procurada, ['nao', 'nunca', 'sem'])) {
+      return null;
+    }
     final exatas = opcoes
         .where(
             (item) => _normalizar(item['nome']?.toString() ?? '') == procurada)
         .toList();
     if (exatas.length == 1) return exatas.single;
-    final aproximadas = opcoes.where((item) {
-      final nome = _normalizar(item['nome']?.toString() ?? '');
-      return nome.startsWith(procurada) ||
-          procurada.startsWith(nome) ||
-          nome.contains(procurada) ||
-          procurada.contains(nome);
-    }).toList();
-    if (aproximadas.length == 1) return aproximadas.single;
-
-    // Aceita abreviações e erros curtos como "calabres". Só aceita um
-    // resultado claramente mais próximo; nunca escolhe entre empates.
     final palavrasEntrada = procurada.split(' ');
-    if (palavrasEntrada.any((palavra) => palavra.length < 4)) return null;
+    if (palavrasEntrada.length > 4 ||
+        palavrasEntrada.any((palavra) => const {
+              'e',
+              'com',
+              'mas',
+              'porque',
+              'pq',
+              'talvez',
+              'acho'
+            }.contains(palavra))) {
+      return null;
+    }
+    if (palavrasEntrada.length > 1) {
+      final prefixos = opcoes.where((item) {
+        final nome = _normalizar(item['nome']?.toString() ?? '');
+        return nome.startsWith('$procurada ');
+      }).toList();
+      return prefixos.length == 1 ? prefixos.single : null;
+    }
+
+    // Uma palavra só pode selecionar por prefixo ou por uma abreviação curta
+    // com distância de edição 1; frases que apenas mencionam um prato não
+    // contam como escolha.
+    if (procurada.length < 4) return null;
+    final prefixos = opcoes.where((item) {
+      final nome = _normalizar(item['nome']?.toString() ?? '');
+      return nome.split(' ').any((palavra) => palavra.startsWith(procurada));
+    }).toList();
+    if (prefixos.length == 1) return prefixos.single;
+    if (prefixos.length > 1) return null;
+
     final distancias = <(Map<String, dynamic>, int)>[];
     for (final item in opcoes) {
       final nome = _normalizar(item['nome']?.toString() ?? '');
       final palavrasNome = nome.split(' ');
       var melhor = 999;
-      for (final palavra in palavrasEntrada) {
-        for (final candidata in palavrasNome) {
-          if (candidata.length < 4) continue;
-          final distancia = _distanciaEdicao(palavra, candidata);
-          final limite = candidata.length <= 5 ? 1 : 2;
-          if (distancia <= limite && distancia < melhor) melhor = distancia;
-        }
+      for (final candidata in palavrasNome) {
+        if (candidata.length < 5) continue;
+        final distancia = _distanciaEdicao(procurada, candidata);
+        if (distancia == 1 && distancia < melhor) melhor = distancia;
       }
       if (melhor < 999) distancias.add((item, melhor));
     }
@@ -1358,14 +1430,21 @@ class BotService {
   }
 
   String _limparRespostaOpcao(String entrada) {
-    var texto = _normalizarIntencao(entrada)
-        .replaceFirst(
-          RegExp(
-            r'^(?:(?:eu )?(?:vou querer|gostaria de|quero|queria)|(?:pode ser|pode se|poderia|vai ser|pode)|(?:sim|claro|isso))\s+',
-          ),
-          '',
-        )
-        .replaceFirst(RegExp(r'^(?:outra|outro|mais uma|mais um)\s+'), '')
+    var texto = _normalizarIntencao(entrada);
+    for (var tentativa = 0; tentativa < 3; tentativa++) {
+      texto = texto
+          .replaceFirst(
+            RegExp(
+              r'^(?:(?:eu )?(?:vou querer|gostaria de adicionar|quero adicionar|queria adicionar|vou querer adicionar|gostaria de|quero|queria)|(?:pode ser|pode se|poderia|vai ser|pode)|(?:adiciona|adicionar|inclui|incluir|coloca|colocar|acrescenta|acrescentar)|(?:sim|claro|isso))\s+',
+            ),
+            '',
+          )
+          .replaceFirst(
+            RegExp(r'^(?:uma?|uns?|as?|os?|outra|outro|mais uma|mais um)\s+'),
+            '',
+          );
+    }
+    texto = texto
         .replaceAll(
             RegExp(r'\b(?:tambem|tbm|por favor|pfv|por gentileza)\b'), ' ')
         .replaceAll(RegExp(r'\s+'), ' ')
@@ -1760,6 +1839,34 @@ class BotService {
         return;
       }
 
+      if (_modoIaAtivo &&
+          sessao != null &&
+          (sessao['etapa'] == 'adicionar_outro' ||
+              sessao['etapa'] == 'ia_pedido') &&
+          _ehPararDeAdicionarMarmitas(entrada) &&
+          _descartarRascunhoProximaMarmita(sessao)) {
+        final dados = Map<String, dynamic>.from(sessao['dados'] as Map? ?? {});
+        dados.remove('itemAtual');
+        dados.remove('rascunhoPedidoIA');
+        dados['itens'] = (dados['itens'] as List? ?? const [])
+            .whereType<Map>()
+            .map((item) => Map<String, dynamic>.from(item))
+            .toList();
+        banco.salvarSessao(
+          telefone: msg.telefone,
+          nome: msg.nome,
+          etapa: 'recebimento',
+          dados: dados,
+        );
+        await whatsapp.enviarTexto(
+          msg.telefone,
+          'Tudo bem, vou deixar só as marmitas que já escolhemos.',
+        );
+        await _mostrarRecebimento(msg, config, dados);
+        banco.finalizarMensagem(msg.id);
+        return;
+      }
+
       final estado = _estadoEfetivo(config);
       if (estado != 'atendendo') {
         await _responderIndisponivel(msg, config, estado, sessao);
@@ -1843,6 +1950,12 @@ class BotService {
       }
 
       if (pedidoIA != null) {
+        final bebida = pedidoIA['_adicionarBebidaResumo'];
+        if (bebida is Map) {
+          await _adicionarBebidaAoResumo(msg, config, sessao, bebida);
+          banco.finalizarMensagem(msg.id);
+          return;
+        }
         await _processarPedidoIA(msg, config, sessao, pedidoIA);
         banco.finalizarMensagem(msg.id);
         return;
@@ -3718,6 +3831,125 @@ class BotService {
           .where((e) => e['ativo'] == true)
           .toList();
 
+  Map<String, dynamic>? _capturarBebidaAdicional(String entrada) {
+    if (_ehPerguntaExplicita(entrada)) return null;
+    final bebidas = _bebidasAtivas();
+    if (bebidas.isEmpty) return null;
+    final texto = _normalizarIntencao(entrada);
+    final bebida = _resolverOpcaoNatural(entrada, bebidas);
+    if (bebida == null) return null;
+
+    final nome = _normalizar(bebida['nome']?.toString() ?? '');
+    final posicao = texto.indexOf(nome);
+    if (posicao < 0) return null;
+    final antes = texto.substring(0, posicao).trim();
+    final quantidadeTexto = antes
+        .replaceAll(
+          RegExp(
+              r'\b(?:quero|queria|gostaria de|adiciona|adicionar|inclui|incluir|coloca|colocar|acrescenta|acrescentar|mais|por favor|uma|um|lata|latas|garrafa|garrafas|unidade|unidades|de)\b'),
+          ' ',
+        )
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    var quantidade = 1;
+    if (quantidadeTexto.isNotEmpty) {
+      final parsed = _parseQuantidade(quantidadeTexto);
+      if (parsed == null || parsed < 1 || parsed > 50) return null;
+      quantidade = parsed;
+    }
+    return {
+      'bebidaId': bebida['id'],
+      'nome': bebida['nome'],
+      'precoUnitario': (bebida['preco'] as num?)?.toDouble() ?? 0.0,
+      'quantidade': quantidade,
+    };
+  }
+
+  Future<void> _adicionarBebidaAoResumo(
+    MensagemWhatsApp msg,
+    Map<String, dynamic> config,
+    Map<String, dynamic>? sessao,
+    Map bebidaEntrada,
+  ) async {
+    final dados = Map<String, dynamic>.from(sessao?['dados'] as Map? ?? {});
+    final bebida = Map<String, dynamic>.from(bebidaEntrada);
+    final bebidas = (dados['bebidas'] as List? ?? const [])
+        .whereType<Map>()
+        .map((item) => Map<String, dynamic>.from(item))
+        .toList();
+    final indice = bebidas.indexWhere((item) =>
+        item['bebidaId'] == bebida['bebidaId'] ||
+        _normalizar(item['nome']?.toString() ?? '') ==
+            _normalizar(bebida['nome']?.toString() ?? ''));
+    if (indice >= 0) {
+      final anterior = (bebidas[indice]['quantidade'] as num?)?.toInt() ?? 0;
+      final nova = (bebida['quantidade'] as num?)?.toInt() ?? 1;
+      if (anterior + nova > 50) {
+        await whatsapp.enviarTexto(msg.telefone,
+            'Posso adicionar até 50 unidades de cada bebida. Quantas você gostaria?');
+        return;
+      }
+      bebidas[indice]['quantidade'] = anterior + nova;
+    } else {
+      bebidas.add(bebida);
+    }
+    dados['bebidas'] = bebidas;
+    dados.remove('bebidaAtual');
+    banco.salvarSessao(
+      telefone: msg.telefone,
+      nome: msg.nome,
+      etapa: 'confirmacao',
+      dados: dados,
+    );
+    final quantidade = (bebida['quantidade'] as num?)?.toInt() ?? 1;
+    await whatsapp.enviarTexto(msg.telefone,
+        'Claro, adicionei ${quantidade > 1 ? '$quantidade ' : ''}${bebida['nome']} ao pedido.');
+    await _mostrarResumo(msg, config, dados);
+  }
+
+  bool _ehPararDeAdicionarMarmitas(String entrada) {
+    final texto = _normalizarIntencao(entrada);
+    return _corresponde(texto, [
+          'nao quero outra',
+          'nao quero mais uma',
+          'so essa',
+          'so essas',
+          'deixa so essa',
+          'deixa so essas',
+          'fica so essa',
+          'cancela a outra',
+          'cancelar a outra',
+          'cancela a proxima',
+          'cancelar a proxima',
+          'nao adiciona outra',
+          'nao adicionar outra',
+          'nao vou querer outra',
+        ]) ||
+        RegExp(r'^(?:so|apenas) (?:essa|essas|a que ja escolhi|as que ja escolhi)$')
+            .hasMatch(texto);
+  }
+
+  bool _descartarRascunhoProximaMarmita(Map<String, dynamic> sessao) {
+    final dados = Map<String, dynamic>.from(sessao['dados'] as Map? ?? {});
+    final itens =
+        (dados['itens'] as List? ?? const []).whereType<Map>().toList();
+    if (itens.isEmpty) return false;
+    final rascunho = Map<String, dynamic>.from(
+      dados['rascunhoPedidoIA'] as Map? ?? const {},
+    );
+    final linhas =
+        (rascunho['itens'] as List? ?? const []).whereType<Map>().toList();
+    final cardapio = banco.obterCardapio();
+    final incompleto = linhas.any((linha) => !_rascunhoItemCompleto(
+          Map<String, dynamic>.from(linha),
+          arrozAtivo: cardapio['fluxoArrozAtivo'] == true,
+          feijaoAtivo: cardapio['fluxoFeijaoAtivo'] == true,
+        ));
+    return sessao['etapa'] == 'adicionar_outro' ||
+        sessao['etapa'] == 'ia_pedido' ||
+        incompleto;
+  }
+
   Future<void> _mostrarBebidasOuResumo(
     MensagemWhatsApp msg,
     Map<String, dynamic> config,
@@ -4427,36 +4659,16 @@ class BotService {
     String entrada,
     List<Map<String, dynamic>> opcoes,
     String Function(Map<String, dynamic>) obterNome,
-  ) {
-    if (_contemTermo(entrada, ['nao', 'nunca', 'sem'])) return null;
-    final texto = ' ${_normalizar(entrada)} ';
-    final correspondencias = opcoes.where((opcao) {
-      final nome = _normalizar(obterNome(opcao));
-      return nome.isNotEmpty && texto.contains(' $nome ');
-    }).toList();
-    if (correspondencias.isEmpty) return null;
-
-    final nomes = correspondencias
-        .map((opcao) => _normalizar(obterNome(opcao)))
-        .toSet()
-        .toList();
-    for (var i = 0; i < nomes.length; i++) {
-      for (var j = i + 1; j < nomes.length; j++) {
-        if (!nomes[i].contains(nomes[j]) && !nomes[j].contains(nomes[i])) {
-          return null;
-        }
-      }
-    }
-
-    final tamanhoMaiorNome = correspondencias
-        .map((opcao) => _normalizar(obterNome(opcao)).length)
-        .reduce((a, b) => a > b ? a : b);
-    final maisEspecificas = correspondencias
-        .where(
-            (opcao) => _normalizar(obterNome(opcao)).length == tamanhoMaiorNome)
-        .toList();
-    return maisEspecificas.length == 1 ? maisEspecificas.single : null;
-  }
+  ) =>
+      _resolverOpcaoNatural(
+        entrada,
+        opcoes
+            .map((opcao) => <String, dynamic>{
+                  ...opcao,
+                  'nome': obterNome(opcao),
+                })
+            .toList(),
+      );
 
   String _descricaoBase(Map<String, dynamic> cardapio) {
     final bases = <String>[
@@ -4833,15 +5045,14 @@ class BotService {
     }
     for (var i = 0; i < itens.length; i++) {
       final item = itens[i];
-      final n = i + 1;
       final umaSo = itens.length == 1;
-      final referencia = umaSo ? 'na sua marmita' : 'na marmita $n';
+      final referencia = _referenciaMarmitaIa(itens, i, totalSolicitado: total);
       if (item['tamanho'] == null) {
         return umaSo && (total ?? 0) > 1
             ? 'Quais tamanhos você prefere para as $total marmitas?'
             : umaSo
                 ? 'Qual tamanho você prefere para sua marmita?'
-                : 'Qual tamanho você prefere para a marmita $n?';
+                : 'Qual tamanho você prefere para a próxima marmita?';
       }
       if (cardapio['fluxoArrozAtivo'] == true && item['arroz'] == null) {
         return 'Qual arroz você prefere $referencia?';
@@ -4860,6 +5071,60 @@ class BotService {
       }
     }
     return 'Quer incluir outra marmita ou podemos finalizar?';
+  }
+
+  String _referenciaMarmitaIa(
+    List<Map<String, dynamic>> itens,
+    int indice, {
+    num? totalSolicitado,
+  }) {
+    final item = itens[indice];
+    final tamanho = item['tamanho']?.toString().trim() ?? '';
+    if (tamanho.isEmpty) {
+      return itens.length == 1 ? 'na sua marmita' : 'na próxima marmita';
+    }
+
+    final tamanhoNormalizado = _normalizar(tamanho);
+    final totalRepresentado = itens.fold<int>(0, (soma, atual) {
+      final qtd = atual['quantidade'];
+      return soma + (qtd is num && qtd >= 1 ? qtd.toInt() : 1);
+    });
+    final temMultiplas = totalRepresentado > 1 || (totalSolicitado ?? 0) > 1;
+    if (!temMultiplas) return 'na sua marmita';
+
+    var numeroInicial = 1;
+    for (var i = 0; i < indice; i++) {
+      if (_normalizar(itens[i]['tamanho']?.toString() ?? '') ==
+          tamanhoNormalizado) {
+        final quantidadeAnterior = itens[i]['quantidade'];
+        numeroInicial += quantidadeAnterior is num && quantidadeAnterior >= 1
+            ? quantidadeAnterior.toInt()
+            : 1;
+      }
+    }
+    final quantidade = item['quantidade'];
+    final unidades = quantidade is num && quantidade >= 1
+        ? quantidade.toInt()
+        : itens.length == 1 && (totalSolicitado ?? 0) > 1
+            ? totalSolicitado!.toInt()
+            : 1;
+    final plural = switch (tamanhoNormalizado) {
+      'pequena' => 'pequenas',
+      'media' => 'médias',
+      'grande' => 'grandes',
+      _ => tamanho.endsWith('a')
+          ? '${tamanho.substring(0, tamanho.length - 1)}as'
+          : '${tamanho}s',
+    };
+    if (unidades == 1) {
+      return 'na marmita ${tamanho.toLowerCase()} $numeroInicial';
+    }
+
+    final numeros = List.generate(unidades, (i) => '${numeroInicial + i}');
+    final listaNumeros = numeros.length == 2
+        ? '${numeros.first} e ${numeros.last}'
+        : '${numeros.take(numeros.length - 1).join(', ')} e ${numeros.last}';
+    return 'nas marmitas $plural $listaNumeros';
   }
 
   bool _ehComandoCorrigir(String entrada) => _correspondeIntencao(entrada, [
