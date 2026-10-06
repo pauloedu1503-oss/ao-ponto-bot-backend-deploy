@@ -40,8 +40,27 @@ class GroqAtendimentoService {
           },
           body: jsonEncode({
             'model': modelo,
-            'max_completion_tokens': 180,
-            'response_format': {'type': 'json_object'},
+            'max_completion_tokens': 512,
+            'include_reasoning': false,
+            'response_format': {
+              'type': 'json_schema',
+              'json_schema': {
+                'name': 'interpretacao_atendimento',
+                'strict': true,
+                'schema': {
+                  'type': 'object',
+                  'properties': {
+                    'tipo': {
+                      'type': 'string',
+                      'enum': ['escolha', 'duvida'],
+                    },
+                    'texto': {'type': 'string'},
+                  },
+                  'required': ['tipo', 'texto'],
+                  'additionalProperties': false,
+                },
+              },
+            },
             'messages': [
               {
                 'role': 'system',
