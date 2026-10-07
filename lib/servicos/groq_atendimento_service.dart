@@ -76,8 +76,16 @@ class GroqAtendimentoService {
                           'mistura': {
                             'type': ['string', 'null']
                           },
+                          'misturas': {
+                            'type': 'array',
+                            'items': {'type': 'string'},
+                          },
                           'acompanhamento': {
                             'type': ['string', 'null']
+                          },
+                          'acompanhamentos': {
+                            'type': 'array',
+                            'items': {'type': 'string'},
                           },
                           'arroz': {
                             'type': ['string', 'null']
@@ -91,7 +99,9 @@ class GroqAtendimentoService {
                           'tamanho',
                           'quantidade',
                           'mistura',
+                          'misturas',
                           'acompanhamento',
+                          'acompanhamentos',
                           'arroz',
                           'feijao',
                         ],
@@ -127,7 +137,7 @@ INTENÇÃO: CARDÁPIO OU DÚVIDA
 INTENÇÃO: MONTAR O PEDIDO
 - Use tipo pedido quando a pessoa quiser pedir, informar ou corrigir qualquer detalhe de uma marmita, adicionar outra ou finalizar as marmitas.
 - Extraia somente dados que a pessoa informou claramente na mensagem atual. Atualize o índice correspondente em rascunhoPedidoAtual; não duplique itens já registrados. Se não houver índice indicado e há um item incompleto, atualize-o; se todos estiverem completos e a pessoa iniciou outra marmita, use o próximo índice.
-- Para cada combinação, capture tamanho, quantidade, mistura, acompanhamento e, apenas quando ativos, arroz e feijão. Se a quantidade não foi dita, não a invente, salvo “uma marmita”/“uma pequena”, que indica quantidade 1. Não deduza quantidade por soma, salvo se a pessoa declarar um total e todas as parcelas restantes ficarem inequívocas; nesse caso, confira a aritmética e use os índices corretos.
+- Para cada combinação, capture tamanho, quantidade, misturas, acompanhamentos e, apenas quando ativos, arroz e feijão. O tamanho escolhido informa quantidadeMisturas e quantidadeAcompanhamentos permitidos/exigidos. Use os arrays misturas e acompanhamentos para preservar todas as escolhas, sem duplicatas e sem exceder as quantidades configuradas. Os campos singulares mistura/acompanhamento são compatibilidade e devem receber a primeira escolha quando houver escolha; os arrays devem conter todas. Se o cliente informou só uma de várias opções exigidas, preserve-a e não invente as demais. Se a quantidade da marmita não foi dita, não a invente, salvo “uma marmita”/“uma pequena”, que indica quantidade 1. Não deduza quantidade por soma, salvo se a pessoa declarar um total e todas as parcelas restantes ficarem inequívocas; nesse caso, confira a aritmética e use os índices corretos.
 - Associe cada detalhe à marmita certa. Exemplo: “duas pequenas: a primeira carne e macarrão, a segunda frango e batata” cria duas combinações distintas, ambas de tamanho Pequena e quantidade 1. Exemplo: “duas pequenas de carne com batata” cria uma combinação com quantidade 2. Não misture acompanhamentos ou misturas entre combinações.
 - Reconheça variações e erros de digitação somente quando houver uma única opção ativa claramente correspondente. Exemplos: “calabres” ou “pode ser calabre” podem indicar “Calabresa acebolada”; “carne moída também” indica “Carne moída”; “pode se batata” indica “Batata”. Grave sempre o nome canônico do cardápio. Se houver mais de uma opção possível, pergunte qual a pessoa quis dizer.
 - Distinga pergunta de escolha. “Vocês não têm calabresa?” ou “calabresa tem?” é uma pergunta de disponibilidade, não escolha de mistura. Responda usando o cardápio. “Calabresa” ou “pode ser calabresa” durante a pergunta sobre mistura é uma escolha.
@@ -143,7 +153,7 @@ COMO CONVERSAR
 
 FORMATO OBRIGATÓRIO
 Devolva somente um objeto JSON válido, sem markdown, comentários ou texto antes/depois, com este formato exato:
-{"tipo":"pedido|duvida|escolha","texto":"","itens":[{"indice":1,"tamanho":null,"quantidade":null,"mistura":null,"acompanhamento":null,"arroz":null,"feijao":null}],"finalizarItens":false}
+{"tipo":"pedido|duvida|escolha","texto":"","itens":[{"indice":1,"tamanho":null,"quantidade":null,"mistura":null,"misturas":[],"acompanhamento":null,"acompanhamentos":[],"arroz":null,"feijao":null}],"finalizarItens":false}
 
 - tipo pedido: texto vazio; itens contém apenas os campos explicitamente capturados ou corrigidos. Se ainda não há detalhe de marmita, use itens vazio e deixar o backend conduzir a pergunta seguinte.
 - tipo duvida: itens vazio; texto contém somente a resposta ao cliente. Para pedido geral do cardápio, texto deve ser exatamente CARDAPIO_CONFIGURADO.
