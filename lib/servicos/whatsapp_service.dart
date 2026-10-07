@@ -11,6 +11,11 @@ class WhatsAppService {
   final Banco banco;
   final http.Client _client;
   final List<Map<String, dynamic>> _mensagensSimuladas = [];
+  final Map<String, ({String texto, int repeticoes, bool encaminhado})>
+      _ultimaRespostaPorTelefone = {};
+
+  static const _avisoEncaminhamento =
+      'Não consegui entender com segurança. Encaminhei a conversa para um atendente, que continuará o atendimento por aqui.';
 
   WhatsAppService(this.banco, {http.Client? client})
       : _client = client ?? http.Client();
@@ -49,6 +54,9 @@ class WhatsAppService {
       );
 
   Future<void> enviarTexto(String telefone, String texto) async {
+    final resposta = _validarRepeticao(telefone, texto);
+    if (resposta == null) return;
+    texto = resposta;
     final caracteres = texto.runes.toList();
     for (var inicio = 0; inicio < caracteres.length; inicio += 4000) {
       final fim = (inicio + 4000).clamp(0, caracteres.length);
@@ -69,6 +77,12 @@ class WhatsAppService {
     String texto,
     List<Map<String, String>> botoes,
   ) async {
+    final resposta = _validarRepeticao(telefone, texto);
+    if (resposta == null) return;
+    if (resposta != texto) {
+      await enviarTexto(telefone, resposta,);
+      return;
+    }
     if (texto.runes.length > 1024 || botoes.isEmpty || botoes.length > 3) {
       await enviarTexto(telefone, _textoNumerado(texto, botoes));
       return;
@@ -114,6 +128,12 @@ class WhatsAppService {
     required String tituloBotao,
     required List<Map<String, String>> opcoes,
   }) async {
+    final resposta = _validarRepeticao(telefone, texto);
+    if (resposta == null) return;
+    if (resposta != texto) {
+      await enviarTexto(telefone, resposta);
+      return;
+    }
     if (opcoes.isEmpty) {
       await enviarTexto(telefone, texto);
       return;
@@ -169,6 +189,34 @@ class WhatsAppService {
         }
       }
     });
+  }
+
+  // Uma resposta idêntica pode ser repetida duas vezes. Na terceira ocorrência
+  // consecutiva, a conversa é encaminhada para evitar que o cliente fique preso
+  // em um loop. Respostas diferentes reiniciam a contagem.
+  String? _validarRepeticao(String telefone, String texto) {
+    final anterior = _ultimaRespostaPorTelefone[telefone];
+    if (anterior?.encaminhado == true) return null;
+
+    final repeticoes = anterior != null && anterior.texto == texto
+        ? anterior.repeticoes + 1
+        : 1;
+    if (repeticoes <= 2) {
+      _ultimaRespostaPorTelefone[telefone] = (
+        texto: texto,
+        repeticoes: repeticoes,
+        encaminhado: false,
+      );
+      return texto;
+    }
+
+    banco.definirModoHumano(telefone, true);
+    _ultimaRespostaPorTelefone[telefone] = (
+      texto: _avisoEncaminhamento,
+      repeticoes: 1,
+      encaminhado: true,
+    );
+    return _avisoEncaminhamento;
   }
 
   Future<void> marcarComoLida(String mensagemId) async {

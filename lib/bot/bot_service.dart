@@ -208,26 +208,24 @@ class BotService {
               'pedido, trocar um item ou cancelar.',
         );
       }
+      if (_ehComandoCancelar(entrada) || !_ehPerguntaExplicita(entrada)) {
+        // Declarações e alterações seguem pelo tratador determinístico do
+        // resumo. Somente perguntas seguem à IA; sua saída abaixo é limitada
+        // a dúvidas e não pode executar confirmações.
+        return null;
+      }
     }
     if (etapaAtual == 'confirmar_cancelamento') {
       if (_ehNegacaoOpcional(entrada)) {
         return const InterpretacaoAtendimento('escolha', 'cancelar_nao');
       }
-      if (_corresponde(entrada, [
-        'sim',
-        's',
-        'isso',
-        'confirmar',
-        'conf_confirmar',
-        'sim cancelar',
-        'cancelar_sim',
-        'sim cancelar pedido',
-        'pode cancelar',
-        'cancelar',
-        'cancela',
-      ])) {
+      if (_ehIntencaoConfirmarCancelamento(entrada)) {
         return const InterpretacaoAtendimento('escolha', 'cancelar_sim');
       }
+      return const InterpretacaoAtendimento(
+        'duvida',
+        'Para cancelar, diga “sim, cancelar pedido”. Se quiser continuar, diga “não”.',
+      );
     }
     if (etapaAtual == 'ia_pedido') {
       final conflito = _perguntarSobreTrocaDeMistura(
@@ -292,8 +290,7 @@ class BotService {
     final perguntaSegura =
         campoLivre ? _extrairPerguntaSemDadosPessoais(msg.entrada) : null;
     final perguntaDeEtapaLivre = perguntaSegura != null ||
-        (etapaAtual == 'endereco' &&
-            _ehPerguntaQueNaoEhEndereco(msg.entrada));
+        (etapaAtual == 'endereco' && _ehPerguntaQueNaoEhEndereco(msg.entrada));
     if (campoLivre && !perguntaDeEtapaLivre) return null;
     final opcoesDiretasEtapa = const {
       'tamanho',
@@ -414,11 +411,6 @@ class BotService {
         'chavePix': config['chavePix'],
         'nomePix': config['nomePix'],
       },
-      'taxasCartao': {
-        'creditoPorFaixa50Reais': 2.0,
-        'debitoPorFaixa50Reais': 1.0,
-        'regra': 'Por faixa iniciada de R\$ 50,00 no subtotal mais a entrega.',
-      },
       'fluxoArrozAtivo': cardapio['fluxoArrozAtivo'] == true,
       'fluxoFeijaoAtivo': cardapio['fluxoFeijaoAtivo'] == true,
       'rascunhoPedidoAtual':
@@ -426,13 +418,21 @@ class BotService {
       'etapaAtual': etapa,
       'opcoesDaEtapa': _opcoesEtapaIA(etapa, sessao, config),
     };
-    return ia.interpretar(
+    final interpretacao = await ia.interpretar(
       mensagem: campoLivre
           ? (perguntaSegura ?? _sanitizarMensagemParaIa(msg.entrada))
           : _sanitizarMensagemParaIa(msg.entrada),
       etapa: etapa,
       contexto: contexto,
     );
+    if (etapa == 'confirmacao' && interpretacao != null) {
+      if (interpretacao.tipo == 'duvida') return interpretacao;
+      return const InterpretacaoAtendimento(
+        'duvida',
+        'Para confirmar, diga “sim, confirmar pedido”. Se quiser alterar algo, me diga o que devo mudar.',
+      );
+    }
+    return interpretacao;
   }
 
   String? _responderPerguntaConhecida(
@@ -3344,6 +3344,11 @@ class BotService {
             _textoFluxo('adicionarOutro', 'botaoNao', 'Finalizar pedido')
           ],
         )) {
+      if (_modoIaAtivo) {
+        dados['recebimento'] = 'entrega';
+        await _pedirEndereco(msg, dados);
+        return;
+      }
       await _mostrarRecebimento(msg, config, dados);
       return;
     }
@@ -3640,8 +3645,7 @@ class BotService {
     }
 
     final mensagem = _modoIaAtivo && cidades.length == 2
-        ? '${cidades[0]['nome'].toString().split(' ').first} ou '
-            '${cidades[1]['nome'].toString().split(' ').first}?'
+        ? 'Barra ou Igaraçu?'
         : _textoFluxo(
             'cidadeEntrega',
             'mensagem',
@@ -3856,6 +3860,10 @@ class BotService {
     Map<String, dynamic> dados, {
     bool permitirPulo = true,
   }) async {
+    if (_modoIaAtivo) {
+      await _pedirTroco(msg, dados);
+      return;
+    }
     final opcoes = _opcoesPagamento(config);
     if (opcoes.isEmpty) {
       await _semOpcao(
@@ -3879,7 +3887,9 @@ class BotService {
     );
     await _enviarBotoes(
       msg.telefone,
-      _textoFluxo('pagamento', 'mensagem', 'Como deseja pagar?'),
+      _modoIaAtivo
+          ? 'Qual será a forma de pagamento?'
+          : _textoFluxo('pagamento', 'mensagem', 'Como deseja pagar?'),
       opcoes,
     );
   }
@@ -3947,23 +3957,21 @@ class BotService {
     dados.remove('trocoPara');
     dados.remove('observacao');
     dados.remove('bebidas');
-    if (_modoIaAtivo && (pagamento == 'credito' || pagamento == 'debito')) {
-      try {
-        final taxa = _calcular(dados, config).taxaMaquininha;
-        if (taxa > 0) {
-          final rotulo = pagamento == 'credito' ? 'crédito' : 'débito';
-          await whatsapp.enviarTexto(
-            msg.telefone,
-            'Para cartão de $rotulo, temos a taxa da maquininha de '
-            '${moeda(taxa)}.',
-          );
-        }
-      } catch (_) {
-        // Sem total calculável, segue o fluxo normal.
-      }
-    }
     if (pagamento == 'dinheiro') {
       await _pedirTroco(msg, dados);
+      return;
+    }
+    if (_modoIaAtivo && (pagamento == 'credito' || pagamento == 'debito')) {
+      final calculo = _calcular(dados, config);
+      final rotulo = pagamento == 'credito' ? 'crédito' : 'débito';
+      if (calculo.taxaMaquininha > 0) {
+        await whatsapp.enviarTexto(
+          msg.telefone,
+          'Temos a taxa da maquininha para pagamento no $rotulo: '
+          '${moeda(calculo.taxaMaquininha)}.',
+        );
+      }
+      await _mostrarResumo(msg, config, dados);
       return;
     }
     await _irParaObservacaoOuResumo(msg, config, dados);
@@ -3994,7 +4002,7 @@ class BotService {
             banco.obterConfiguracao()['dados'] as Map,
           );
           final total = _calcular(dados, config).total;
-          mensagem = 'Ficou ${moeda(total)}. Vai precisar de troco?';
+          mensagem = 'Seu pedido ficou ${moeda(total)}. Vai precisar de troco?';
         } catch (_) {
           // Mantém a pergunta padrão se não for possível calcular o total.
         }
@@ -4009,8 +4017,31 @@ class BotService {
     Map<String, dynamic> dados,
     String entrada,
   ) async {
+    final formaInformada = _resolverFormaPagamento(entrada);
+    if (formaInformada != null ||
+        (_modoIaAtivo && _ehPedidoCartaoGenerico(entrada, config))) {
+      if (_modoIaAtivo && _ehPedidoCartaoGenerico(entrada, config)) {
+        await whatsapp.enviarTexto(msg.telefone, 'Crédito ou débito?');
+        return;
+      }
+      await _tratarPagamento(msg, config, dados, formaInformada!);
+      return;
+    }
     if (_ehNegacaoDeTroco(entrada)) {
       dados['trocoPara'] = null;
+      if (_modoIaAtivo && dados['pagamento'] == null) {
+        banco.salvarSessao(
+          telefone: msg.telefone,
+          nome: msg.nome,
+          etapa: 'troco',
+          dados: dados,
+        );
+        await whatsapp.enviarTexto(
+          msg.telefone,
+          'Certo 😊 Você prefere pagar por Pix, dinheiro ou cartão?',
+        );
+        return;
+      }
       await _irParaObservacaoOuResumo(msg, config, dados);
       return;
     }
@@ -4293,6 +4324,28 @@ class BotService {
     final igual =
         RegExp(r'\b(?:igual|iguais|mesma|mesmo|anterior)\b').hasMatch(texto);
 
+    Map<String, dynamic>? encontraOpcaoNaFrase(String chave) {
+      final normalizada = _normalizarIntencao(entrada);
+      final encontradas = _itensAtivos(cardapio, chave).where((opcao) {
+        final nome = _normalizarIntencao(opcao['nome']?.toString() ?? '');
+        if (nome.isEmpty) return false;
+        if (RegExp(r'(?:^| )' + RegExp.escape(nome) + r'(?: |$)')
+            .hasMatch(normalizada)) return true;
+        return nome.split(' ').any((palavra) =>
+            palavra.length >= 4 && _contemTermo(normalizada, [palavra]));
+      }).toList();
+      return encontradas.length == 1 ? encontradas.single : null;
+    }
+
+    final mistura = encontraOpcaoNaFrase('misturas');
+    final acompanhamento = encontraOpcaoNaFrase('acompanhamentos');
+    final arroz = cardapio['fluxoArrozAtivo'] == true
+        ? encontraOpcaoNaFrase('arrozes')
+        : null;
+    final feijao = cardapio['fluxoFeijaoAtivo'] == true
+        ? encontraOpcaoNaFrase('feijoes')
+        : null;
+
     if (!indicaMarmita && tamanho == null && !indicaMais) return null;
     if (!indicaMarmita && tamanho == null && !igual) {
       if (_extrairTotalMarmitas(entrada) == null &&
@@ -4333,6 +4386,10 @@ class BotService {
         {
           'indice': indice,
           if (tamanho != null) 'tamanho': tamanho['nome'],
+          if (mistura != null) 'mistura': mistura['nome'],
+          if (acompanhamento != null) 'acompanhamento': acompanhamento['nome'],
+          if (arroz != null) 'arroz': arroz['nome'],
+          if (feijao != null) 'feijao': feijao['nome'],
           'quantidade': quantidade,
         }
       ],
@@ -4466,6 +4523,147 @@ class BotService {
     await _mostrarResumo(msg, config, dados);
   }
 
+  Future<bool> _tratarAlteracaoMarmitaNaConfirmacao(
+    MensagemWhatsApp msg,
+    Map<String, dynamic> config,
+    Map<String, dynamic> dados,
+    String entrada,
+  ) async {
+    final texto = _normalizarIntencao(entrada);
+    final itens = (dados['itens'] as List? ?? const [])
+        .whereType<Map>()
+        .map((item) => Map<String, dynamic>.from(item))
+        .toList();
+    if (itens.isEmpty) return false;
+    final querTrocar = RegExp(
+      r'\b(?:troca(?:r)?|muda(?:r)?|altera(?:r)?|substitui(?:r)?)\b',
+    ).hasMatch(texto);
+    final querQuantidade = RegExp(
+      r'\b(?:quantidade|qtd|unidades|marmitas)\b',
+    ).hasMatch(texto);
+    if (!querTrocar && !querQuantidade) return false;
+    if (querQuantidade) {
+      final valor =
+          RegExp(r'\b(?:para|por)\s+(\d{1,2})\b').firstMatch(texto)?.group(1);
+      final qtd = valor == null ? null : int.tryParse(valor);
+      if (qtd == null || qtd < 1 || qtd > 50) {
+        await whatsapp.enviarTexto(
+          msg.telefone,
+          'Quantas marmitas você quer nessa combinação?',
+        );
+        return true;
+      }
+      final indiceMatch =
+          RegExp(r'\b(?:marmita|item)\s*(\d+)\b').firstMatch(texto);
+      final indice = indiceMatch == null
+          ? itens.length - 1
+          : (int.tryParse(indiceMatch.group(1)!) ?? 1) - 1;
+      if (indice < 0 || indice >= itens.length) {
+        await whatsapp.enviarTexto(
+          msg.telefone,
+          'Não encontrei essa marmita no pedido.',
+        );
+        return true;
+      }
+      itens[indice]['quantidade'] = qtd;
+      dados['itens'] = itens;
+      banco.salvarSessao(
+        telefone: msg.telefone,
+        nome: msg.nome,
+        etapa: 'confirmacao',
+        dados: dados,
+      );
+      await whatsapp.enviarTexto(msg.telefone, 'Atualizei a quantidade.');
+      await _mostrarResumo(msg, config, dados);
+      return true;
+    }
+
+    final cardapio = banco.obterCardapio();
+    final grupos = <String, List<Map<String, dynamic>>>{
+      'tamanho': _itensAtivos(cardapio, 'tamanhos'),
+      'mistura': _itensAtivos(cardapio, 'misturas'),
+      'acompanhamento': _itensAtivos(cardapio, 'acompanhamentos'),
+      if (cardapio['fluxoArrozAtivo'] == true)
+        'arroz': _itensAtivos(cardapio, 'arrozes'),
+      if (cardapio['fluxoFeijaoAtivo'] == true)
+        'feijao': _itensAtivos(cardapio, 'feijoes'),
+    };
+    final campoExplicito = <String, List<String>>{
+      'tamanho': ['tamanho', 'pequena', 'media', 'grande'],
+      'mistura': ['mistura', 'misturado', 'carne', 'frango', 'calabresa'],
+      'acompanhamento': ['acompanhamento', 'guarnicao', 'batata', 'macarrao'],
+      'arroz': ['arroz'],
+      'feijao': ['feijao'],
+    };
+    var tipo = grupos.keys
+        .where((campo) => (campoExplicito[campo] ?? [campo])
+            .any((termo) => _contemTermo(texto, [termo])))
+        .firstOrNull;
+    if (tipo == null) {
+      final citados = grupos.entries
+          .where((grupo) => grupo.value.any((opcao) {
+                final nome =
+                    _normalizarIntencao(opcao['nome']?.toString() ?? '');
+                return nome.isNotEmpty &&
+                    RegExp(r'(?:^| )' + RegExp.escape(nome) + r'(?: |$)')
+                        .hasMatch(texto);
+              }))
+          .map((grupo) => grupo.key)
+          .toList();
+      if (citados.length == 1) tipo = citados.single;
+    }
+    if (tipo == null) {
+      await whatsapp.enviarTexto(
+        msg.telefone,
+        'Qual parte da marmita você quer alterar: tamanho, mistura ou acompanhamento?',
+      );
+      return true;
+    }
+    final novos = grupos[tipo]!;
+    final trechoNovo = RegExp(r'\b(?:por|para|no lugar de)\s+(.+)$')
+        .firstMatch(texto)
+        ?.group(1)
+        ?.trim();
+    final opcao = trechoNovo == null
+        ? _resolverOpcaoNatural(entrada, novos)
+        : _resolverOpcaoNatural(trechoNovo, novos);
+    final indiceMatch =
+        RegExp(r'\b(?:marmita|item)\s*(\d+)\b').firstMatch(texto);
+    final indicePedido = indiceMatch == null
+        ? itens.length - 1
+        : (int.tryParse(indiceMatch.group(1)!) ?? 1) - 1;
+    if (indicePedido < 0 || indicePedido >= itens.length) {
+      await whatsapp.enviarTexto(
+          msg.telefone, 'Não encontrei essa marmita no pedido.');
+      return true;
+    }
+    final item = itens[indicePedido];
+    if (opcao == null) {
+      await whatsapp.enviarTexto(
+        msg.telefone,
+        'Qual opção de $tipo você prefere?',
+      );
+      return true;
+    }
+    final idCampo = '${tipo}Id';
+    final nomeCampo = '${tipo}Nome';
+    item[idCampo] = opcao['id'];
+    item[nomeCampo] = opcao['nome'];
+    if (tipo == 'tamanho') {
+      item['precoUnitario'] = (opcao['preco'] as num).toDouble();
+    }
+    dados['itens'] = itens;
+    banco.salvarSessao(
+      telefone: msg.telefone,
+      nome: msg.nome,
+      etapa: 'confirmacao',
+      dados: dados,
+    );
+    await whatsapp.enviarTexto(msg.telefone, 'Atualizei a marmita no pedido.');
+    await _mostrarResumo(msg, config, dados);
+    return true;
+  }
+
   Future<bool> _tratarBebidaNaConfirmacao(
     MensagemWhatsApp msg,
     Map<String, dynamic> config,
@@ -4485,8 +4683,8 @@ class BotService {
     ).firstMatch(texto);
 
     if (troca != null) {
-      final alvo = _resolverOpcaoNatural(
-          _semArtigo(troca.group(1)!.trim()), bebidas);
+      final alvo =
+          _resolverOpcaoNatural(_semArtigo(troca.group(1)!.trim()), bebidas);
       final nova = _resolverOpcaoNatural(
           _semArtigo(troca.group(2)!.trim()), _bebidasAtivas());
       if (alvo == null || nova == null) {
@@ -4522,7 +4720,8 @@ class BotService {
       return true;
     }
 
-    if (_contemTermo(texto, ['troca', 'trocar', 'muda', 'mudar', 'substitui', 'substituir'])) {
+    if (_contemTermo(texto,
+        ['troca', 'trocar', 'muda', 'mudar', 'substitui', 'substituir'])) {
       await whatsapp.enviarTexto(
         msg.telefone,
         'Qual bebida você quer tirar e qual prefere colocar no lugar?',
@@ -4535,8 +4734,8 @@ class BotService {
     ).firstMatch(texto);
     if (remover == null) return false;
 
-    final alvo = _resolverOpcaoNatural(
-        _semArtigo(remover.group(1)!.trim()), bebidas);
+    final alvo =
+        _resolverOpcaoNatural(_semArtigo(remover.group(1)!.trim()), bebidas);
     if (alvo == null) return false;
 
     dados['bebidas'] = bebidas
@@ -4999,6 +5198,14 @@ class BotService {
       if (await _tratarBebidaNaConfirmacao(msg, config, dados, entrada)) {
         return;
       }
+      if (await _tratarAlteracaoMarmitaNaConfirmacao(
+        msg,
+        config,
+        dados,
+        entrada,
+      )) {
+        return;
+      }
       final captura = _capturarAdicaoMarmitasConfirmacao(entrada, dados);
       if (captura != null) {
         await _adicionarMarmitasPosResumo(msg, config, dados, captura);
@@ -5014,6 +5221,10 @@ class BotService {
           _textoFluxo('resumo', 'botaoConfirmar', 'Confirmar')
         ]) &&
         !_ehConfirmacaoDoResumo(entrada)) {
+      await whatsapp.enviarTexto(
+        msg.telefone,
+        'Não confirmei o pedido. Para confirmar, diga “sim, confirmar pedido”; se quiser alterar, me diga o que devo mudar.',
+      );
       await _mostrarResumo(msg, config, dados);
       return;
     }
@@ -5382,8 +5593,9 @@ class BotService {
     }
     if (texto.contains('?')) return false;
     final nega = RegExp(r'\b(?:nao|sem|dispenso|deixa)\b').hasMatch(texto);
-    final troco = RegExp(r'\b(?:troco|preciso|precisar|precisa|vou precisar|quero)\b')
-        .hasMatch(texto);
+    final troco =
+        RegExp(r'\b(?:troco|preciso|precisar|precisa|vou precisar|quero)\b')
+            .hasMatch(texto);
     return nega && troco;
   }
 
@@ -5512,49 +5724,43 @@ class BotService {
   }
 
   bool _ehConfirmacaoDoResumo(String entrada) {
-    final texto = _normalizar(entrada)
-        .replaceFirst(RegExp(r'^(?:eu|por favor) '), '');
+    final texto =
+        _normalizar(entrada).replaceFirst(RegExp(r'^(?:eu|por favor) '), '');
     if (_contemTermo(texto, ['nao', 'nunca'])) return false;
+    if (_ehPedidoAlteracaoResumo(texto)) return false;
     return _corresponde(texto, [
       'sim',
       's',
-      'isso',
-      'isso ai',
-      'isso mesmo',
-      'ta certo',
-      'ta sim',
-      'esta certo',
-      'esta sim',
-      'certo',
-      'ok',
-      'okay',
-      'beleza',
-      'show',
-      'fechado',
       'confirmar',
-      'confirma',
-      'confirme',
-      'conf_confirmar',
       'confirmar pedido',
-      'confirma pedido',
+      'confirmo o pedido',
+      'conf_confirmar',
       'pode confirmar',
-      'pode sim',
-      'finalizar',
-      'finaliza',
-      'pode fechar',
+      'pode confirmar o pedido',
+      'sim pode confirmar',
+      'sim pode confirmar o pedido',
+      'sim pode confirmar',
+      'beleza pode confirmar o pedido',
+      'perfeito pode confirmar o pedido',
+      'ok pode confirmar o pedido',
+      'ok confirma o pedido',
+      'sim confirmar pedido',
+      'ok confirmar',
+      'ok pode confirmar',
+      'okay pode confirmar',
+      'beleza pode confirmar',
+      'pode finalizar o pedido',
       'pode fechar o pedido',
-      'fecha',
-      'fechar',
-      'otimo',
-      'perfeito',
-      'perfeita',
-      'com certeza',
-      'claro',
-      'sim por favor',
-      'pode ir',
-      'manda',
-      'bora',
+      'sim pode finalizar o pedido',
+      'sim pode fechar o pedido',
     ]);
+  }
+
+  bool _ehPedidoAlteracaoResumo(String entrada) {
+    final texto = _normalizar(entrada);
+    return RegExp(
+      r'\b(?:mas|porem|troca|trocar|muda|mudar|altera|alterar|corrige|corrigir|tira|tirar|remove|remover|adiciona|adicionar|sem|no lugar|em vez|na verdade|faltou|esqueci)\b',
+    ).hasMatch(texto);
   }
 
   bool _ehPerguntaQueNaoEhEndereco(String entrada) {
@@ -5938,27 +6144,18 @@ class BotService {
     String entrada,
   ) async {
     final dados = Map<String, dynamic>.from(sessao['dados'] as Map? ?? {});
-    final confirmou = _correspondeIntencao(entrada, [
-      'cancelar_sim',
-      'sim',
-      'sim cancelar',
-      'confirmar cancelamento',
-      'pode cancelar',
-      'cancelar',
-      'cancela',
-      if (!_modoIaAtivo) '0',
-    ]);
-    final continuou = _correspondeIntencao(entrada, [
-      'cancelar_nao',
-      'nao',
-      'continuar pedido',
-      'continuar',
-      'nao cancelar',
-      'manter pedido',
-      'voltar',
-      'volta',
-      'volte',
-    ]);
+    final confirmou = _ehIntencaoConfirmarCancelamento(entrada);
+    final continuou = _ehNegacaoOpcional(entrada) ||
+        _correspondeIntencao(entrada, [
+          'cancelar_nao',
+          'continuar pedido',
+          'continuar',
+          'nao cancelar',
+          'manter pedido',
+          'voltar',
+          'volta',
+          'volte',
+        ]);
 
     if (confirmou) {
       _salvarInicioLimpo(msg.telefone, msg.nome);
@@ -5993,16 +6190,25 @@ class BotService {
       return;
     }
 
-    await _enviarBotoes(
+    await whatsapp.enviarTexto(
       msg.telefone,
-      _modoIaAtivo
-          ? 'Você gostaria de cancelar o pedido?'
-          : 'Escolha se deseja cancelar ou continuar o pedido:',
-      const [
-        {'id': 'cancelar_sim', 'titulo': 'Sim, cancelar'},
-        {'id': 'cancelar_nao', 'titulo': 'Continuar pedido'},
-      ],
+      'Você quer cancelar o pedido ou continuar com ele?',
     );
+  }
+
+  bool _ehIntencaoConfirmarCancelamento(String entrada) {
+    final texto = _normalizarIntencao(entrada);
+    if (_ehNegacaoOpcional(texto)) return false;
+    return _correspondeIntencao(texto, [
+      'cancelar_sim',
+      'sim cancelar',
+      'sim pode cancelar',
+      'confirmar cancelamento',
+      'pode cancelar',
+      'cancelar',
+      'cancela',
+      if (!_modoIaAtivo) '0',
+    ]);
   }
 
   Future<void> _responderAjuda(
