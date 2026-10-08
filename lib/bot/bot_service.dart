@@ -149,6 +149,8 @@ class BotService {
     final entrada = _normalizar(msg.entrada);
     if (_ehSaudacaoSimples(entrada) ||
         _ehNegacaoPedido(entrada) ||
+        _ehAgradecimentoSimples(entrada) ||
+        _ehDesistenciaExplicita(entrada) ||
         _ehSolicitacaoCardapio(entrada) ||
         RegExp(r'^[\s?!.…]+$').hasMatch(msg.entrada)) {
       return null;
@@ -1014,21 +1016,34 @@ class BotService {
         etapa: 'ia_pedido',
         dados: dados,
       );
+      final totalMarmitas = rascunho['quantidadeTotalSolicitada'] is num
+          ? (rascunho['quantidadeTotalSolicitada'] as num).toInt()
+          : null;
       final jaIndicouMarmita = _contemTermo(
         msg.entrada,
         ['marmita', 'marmitas', 'pequena', 'media', 'grande'],
       );
-      final totalMarmitas = rascunho['quantidadeTotalSolicitada'] is num
-          ? (rascunho['quantidadeTotalSolicitada'] as num).toInt()
-          : null;
-      await whatsapp.enviarTexto(
-        msg.telefone,
-        (totalMarmitas ?? 0) > 1
-            ? 'Quais tamanhos você prefere para as $totalMarmitas marmitas?'
-            : jaIndicouMarmita
-                ? 'Qual tamanho você prefere?'
-                : _perguntaInicioPedidoIA(),
-      );
+      if (totalMarmitas == null && !jaIndicouMarmita) {
+        await whatsapp.enviarTexto(
+          msg.telefone,
+          'Quantas marmitas vai ser?',
+        );
+      } else if (totalMarmitas == null && jaIndicouMarmita) {
+        await whatsapp.enviarTexto(
+          msg.telefone,
+          'Vamos montar a sua marmita. Quantas marmitas vai ser?',
+        );
+      } else if ((totalMarmitas ?? 0) > 1) {
+        await whatsapp.enviarTexto(
+          msg.telefone,
+          'Vamos montar a primeira marmita. Quais tamanhos você prefere para as $totalMarmitas marmitas?',
+        );
+      } else {
+        await whatsapp.enviarTexto(
+          msg.telefone,
+          'Vamos montar a sua marmita. Qual tamanho você prefere?',
+        );
+      }
       return;
     }
 
@@ -1317,7 +1332,16 @@ class BotService {
         : item[campoSingular] == null
             ? const <String>[]
             : [item[campoSingular].toString().trim()];
-    return valores.where((value) => value.isNotEmpty).toSet().toList();
+    final filtrados = valores.where((value) => value.isNotEmpty).toList();
+    // Permite valores repetidos quando a quantidade permitida é maior que 1.
+    // Isso permite que o cliente escolha duas misturas iguais, por exemplo.
+    final quantidadePermitida = campoPlural == 'misturas'
+        ? (item['quantidadeMisturas'] as num?)?.toInt() ?? 1
+        : (item['quantidadeAcompanhamentos'] as num?)?.toInt() ?? 1;
+    if (quantidadePermitida > 1) {
+      return filtrados;
+    }
+    return filtrados.toSet().toList();
   }
 
   List<Map<String, dynamic>> _itensAtivos(
@@ -2007,10 +2031,6 @@ class BotService {
     return correspondentes.length == 1 ? correspondentes.single : null;
   }
 
-  String _perguntaInicioPedidoIA() {
-    return 'Claro! O que você gostaria de pedir?';
-  }
-
   String _perguntaOpcaoIA(
     String pergunta,
     List<Map<String, dynamic>> opcoes,
@@ -2195,6 +2215,116 @@ class BotService {
             sessao['etapa'] != 'inicio' &&
             _estadoEfetivo(config) == 'atendendo') {
           await _responderAjuda(msg, sessao);
+        }
+        banco.finalizarMensagem(msg.id);
+        return;
+      }
+      // Na etapa de confirmação, "ok" e "não quero pedir" seguem a lógica de
+      // confirmação, não a de agradecimento/desistência genérica.
+      final etapaAtual = sessao?['etapa']?.toString() ?? 'inicio';
+      final ehConfirmacao = etapaAtual == 'confirmacao';
+      
+      if (_modoIaAtivo && _ehDesistenciaExplicita(entrada)) {
+        // Na confirmação, desistência explícita remove os itens do pedido
+        if (ehConfirmacao) {
+          _salvarInicioLimpo(
+            msg.telefone,
+            msg.nome,
+            boasVindasEnviada: true,
+          );
+          await whatsapp.enviarTexto(
+            msg.telefone,
+            'removi todas as marmitas e bebidas. A Ao Ponto agradece! Estamos à disposição quando precisar.',
+          );
+        } else {
+          _salvarInicioLimpo(
+            msg.telefone,
+            msg.nome,
+            boasVindasEnviada: true,
+          );
+          await whatsapp.enviarTexto(
+            msg.telefone,
+            'A Ao Ponto agradece! Estamos à disposição quando precisar.',
+          );
+        }
+        banco.finalizarMensagem(msg.id);
+        return;
+      }
+      if (_modoIaAtivo && _ehAgradecimentoSimples(entrada) && !ehConfirmacao) {
+        if (sessao != null && sessao['etapa'] != 'inicio' && _estadoEfetivo(config) == 'atendendo') {
+          await whatsapp.enviarTexto(
+            msg.telefone,
+            'Por nada! 😊 ${_textoAjudaEtapa(sessao)}',
+          );
+        } else {
+          _salvarInicioLimpo(
+            msg.telefone,
+            msg.nome,
+            boasVindasEnviada: true,
+          );
+        }
+        banco.finalizarMensagem(msg.id);
+        return;
+      }
+      if (_modoIaAtivo && _ehElogioOuComentarioPositivo(entrada) && !ehConfirmacao) {
+        // Elogios não alteram o estado do pedido. Responde cordialmente e,
+        // se houver pedido em andamento, continua de onde parou.
+        if (sessao != null && sessao['etapa'] != 'inicio' && _estadoEfetivo(config) == 'atendendo') {
+          await whatsapp.enviarTexto(
+            msg.telefone,
+            'Que bom que você gostou! A Ao Ponto agradece o carinho 😊 ${_textoAjudaEtapa(sessao)}',
+          );
+        } else {
+          await whatsapp.enviarTexto(
+            msg.telefone,
+            'Que legal! Agradecemos pelo carinho 😊 Estamos à disposição se quiser pedir.',
+          );
+        }
+        banco.finalizarMensagem(msg.id);
+        return;
+      }
+      if (_modoIaAtivo && _ehReclamacao(entrada) && !ehConfirmacao) {
+        // Reclamações não alteram o estado do pedido. Responde com empatia e,
+        // se houver pedido em andamento, continua de onde parou.
+        if (sessao != null && sessao['etapa'] != 'inicio' && _estadoEfetivo(config) == 'atendendo') {
+          await whatsapp.enviarTexto(
+            msg.telefone,
+            'Lamento muito pela experiência! Vou anotar seu feedback e encaminhar para a equipe. 😔 ${_textoAjudaEtapa(sessao)}',
+          );
+        } else {
+          await whatsapp.enviarTexto(
+            msg.telefone,
+            'Lamento muito pela experiência! Vou anotar seu feedback e encaminhar para a equipe. Se quiser, posso ajudar com um novo pedido.',
+          );
+        }
+        banco.finalizarMensagem(msg.id);
+        return;
+      }
+      if (_modoIaAtivo && _ehIndecisao(entrada) && !ehConfirmacao && etapaAtual != 'cidade_entrega') {
+        // Indecisão não altera o estado do pedido. Ajuda o cliente a escolher.
+        // Não interfere na etapa de cidade_entrega, onde "nao sei ainda" é uma resposta válida.
+        if (sessao != null && sessao['etapa'] != 'inicio' && _estadoEfetivo(config) == 'atendendo') {
+          await whatsapp.enviarTexto(
+            msg.telefone,
+            'Sem problemas! Posso ajudar você a escolher. ${_textoAjudaEtapa(sessao)}',
+          );
+        } else {
+          final cardapio = banco.obterCardapio();
+          final misturas = (cardapio['misturas'] as List? ?? const [])
+              .where((e) => (e as Map)['ativo'] == true)
+              .toList();
+          if (misturas.isNotEmpty) {
+            final sugestoes = misturas.take(3).map((e) => '• ${(e as Map)['nome']}').join('\n');
+            await whatsapp.enviarTexto(
+              msg.telefone,
+              'Claro! Aqui estão algumas sugestões populares:\n$sugestoes\n\nQual delas te agrada mais?',
+            );
+          } else {
+            await whatsapp.enviarTexto(
+              msg.telefone,
+              'Claro! Posso ajudar você a escolher. O que você gostaria de pedir?',
+            );
+          }
         }
         banco.finalizarMensagem(msg.id);
         return;
@@ -2814,9 +2944,251 @@ class BotService {
     return texto.replaceAll(RegExp(r'\s+'), ' ').trim();
   }
 
-  bool _ehSaudacaoSimples(String entrada) => RegExp(
-        r'^(?:(?:oi+|ola|oie|opa|salve|e ai|bom dia|boa tarde|boa noite|tudo bem|tudo bom|tudo certo|como vai)(?:\s+(?:oi+|ola|oie|opa|salve|e ai|bom dia|boa tarde|boa noite|tudo bem|tudo bom|tudo certo|como vai))*)$',
-      ).hasMatch(_normalizar(entrada));
+
+
+  bool _ehAgradecimentoSimples(String entrada) {
+    final norm = _normalizar(entrada).replaceAll(RegExp(r'[^a-z\s]'), '').trim();
+    if (norm.isEmpty) return false;
+    final words = norm.split(RegExp(r'\s+'));
+    final validWords = {
+      'ok', 'ta', 'bom', 'tabom', 'beleza', 'blz', 'joia', 'maravilha', 'show',
+      'valeu', 'vlw', 'obrigado', 'obrigada', 'obg', 'obgd', 'agradeco', 'agradecido',
+      'agradecida', 'obrigadinho', 'obrigadinha', 'valeuzinho', 'valeuzinha',
+      'agradecimento', 'agradecimentos', 'obrigacoes', 'obrigacao',
+      'valeumesmo', 'obrigadomesmo', 'obrigadamesmo',
+      'muitobrigado', 'muitobrigada', 'muitissimoobrigado', 'muitissimoobrigada',
+      'obrigadopelaajuda', 'obrigadapelaajuda', 'obrigadopelaatencao', 'obrigadapelaatencao',
+      'valeupelaajuda', 'valeupelaatencao', 'agradecopelaajuda', 'agradecopelaatencao',
+      'obrigadopeloatendimento', 'obrigadapeloatendimento',
+      'valeupeloatendimento', 'agradecopeloatendimento',
+      'obrigadopelacomida', 'obrigadapelacomida',
+      'valeupelacomida', 'agradecopelacomida',
+      'obrigadopelaentrega', 'obrigadapelaentrega',
+      'valeupelaentrega', 'agradecopelaentrega',
+      'obrigadopeloservico', 'obrigadapeloservico',
+      'valeupeloservico', 'agradecopeloservico',
+      'obrigadopelacarinho', 'obrigadapelacarinho',
+      'valeupelacarinho', 'agradecopelacarinho',
+      'obrigadopelapreferencia', 'obrigadapelapreferencia',
+      'valeupelapreferencia', 'agradecopelapreferencia',
+      'obrigadopelaconfianca', 'obrigadapelaconfianca',
+      'valeupelaconfianca', 'agradecopelaconfianca',
+      'obrigadopelaoportunidade', 'obrigadapelaoportunidade',
+      'valeupelaoportunidade', 'agradecopelaoportunidade',
+      'obrigadopelaparceria', 'obrigadapelaparceria',
+      'valeupelaparceria', 'agradecopelaparceria',
+      'obrigadopelaamizade', 'obrigadapelaamizade',
+      'valeupelaamizade', 'agradecopelaamizade',
+      'obrigadopelacompanhia', 'obrigadapelacompanhia',
+      'valeupelacompanhia', 'agradecopelacompanhia',
+      'obrigadopelapresenca', 'obrigadapelapresenca',
+      'valeupelapresenca', 'agradecopelapresenca',
+      'obrigadopelavisita', 'obrigadapelavisita',
+      'valeupelavisita', 'agradecopelavisita',
+      'obrigadopelocontato', 'obrigadapelocontato',
+      'valeupelocontato', 'agradecopelocontato',
+      'obrigadopeloretorno', 'obrigadapeloretorno',
+      'valeupeloretorno', 'agradecopeloretorno',
+      'obrigadopeladedicacao', 'obrigadapeladedicacao',
+      'valeupeladedicacao', 'agradecopeladedicacao',
+      'obrigadopeloempenho', 'obrigadapeloempenho',
+      'valeupeloempenho', 'agradecopeloempenho',
+      'obrigadopeloprofissionalismo', 'obrigadapeloprofissionalismo',
+      'valeupeloprofissionalismo', 'agradecopeloprofissionalismo',
+      'obrigadopelqualidade', 'obrigadapelqualidade',
+      'valeupelqualidade', 'agradecopelqualidade',
+      'obrigadopelosabor', 'obrigadapelosabor',
+      'valeupelosabor', 'agradecopelosabor',
+      'obrigadopelotempero', 'obrigadapelotempero',
+      'valeupelotempero', 'agradecopelotempero',
+      'obrigadopelocapricho', 'obrigadapelocapricho',
+      'valeupelocapricho', 'agradecopelocapricho',
+      'obrigadopelocuidado', 'obrigadapelocuidado',
+      'valeupelocuidado', 'agradecopelocuidado',
+      'obrigadopelozelo', 'obrigadapelozelo',
+      'valeupelozelo', 'agradecopelozelo',
+      'obrigadopelocomprometimento', 'obrigadapelocomprometimento',
+      'valeupelocomprometimento', 'agradecopelocomprometimento',
+      'obrigadopelaseriedade', 'obrigadapelaseriedade',
+      'valeupelaseriedade', 'agradecopelaseriedade',
+      'obrigadopelahonestidade', 'obrigadapelahonestidade',
+      'valeupelahonestidade', 'agradecopelahonestidade',
+      'obrigadopelatransparencia', 'obrigadapelatransparencia',
+      'valeupelatransparencia', 'agradecopelatransparencia',
+      'obrigadopelaclareza', 'obrigadapelaclareza',
+      'valeupelaclareza', 'agradecopelaclareza',
+      'obrigadopelaobjetividade', 'obrigadapelaobjetividade',
+      'valeupelaobjetividade', 'agradecopelaobjetividade',
+      'obrigadopelaeficiencia', 'obrigadapelaeficiencia',
+      'valeupelaeficiencia', 'agradecopelaeficiencia',
+      'obrigadopelaagilidade', 'obrigadapelaagilidade',
+      'valeupelaagilidade', 'agradecopelaagilidade',
+      'obrigadopelapontualidade', 'obrigadapelapontualidade',
+      'valeupelapontualidade', 'agradecopelapontualidade',
+      'obrigadopelarapidez', 'obrigadapelarapidez',
+      'valeupelarapidez', 'agradecopelarapidez',
+      'obrigadopelapresteza', 'obrigadapelapresteza',
+      'valeupelapresteza', 'agradecopelapresteza',
+      'obrigadopelasolicitude', 'obrigadapelasolicitude',
+      'valeupelasolicitude', 'agradecopelasolicitude',
+      'obrigadopelagentileza', 'obrigadapelagentileza',
+      'valeupelagentileza', 'agradecopelagentileza',
+      'obrigadopelasimpatia', 'obrigadapelasimpatia',
+      'valeupelasimpatia', 'agradecopelasimpatia',
+      'obrigadopelaeducacao', 'obrigadapelaeducacao',
+      'valeupelaeducacao', 'agradecopelaeducacao',
+      'obrigadopelacordialidade', 'obrigadapelacordialidade',
+      'valeupelacordialidade', 'agradecopelacordialidade',
+      'obrigadopelahospitalidade', 'obrigadapelahospitalidade',
+      'valeupelahospitalidade', 'agradecopelahospitalidade',
+      'obrigadopelareceptividade', 'obrigadapelareceptividade',
+      'valeupelareceptividade', 'agradecopelareceptividade',
+    };
+    // Agradecimento simples só deve ser correspondido se TODAS as palavras da mensagem fizerem parte deste dicionário restrito de "agradecimentos/confirmações vazias".
+    // Isso evita que "ok confirmar pedido" ou "ok obg quero pedir" seja tratado como um agradecimento isolado.
+    return words.every((w) => validWords.contains(w));
+  }
+
+  bool _ehElogioOuComentarioPositivo(String entrada) {
+    final texto = _normalizarIntencao(entrada);
+    
+    // Padrões de elogio sobre comida/qualidade
+    final padroesElogio = [
+      r'\b(?:tava|estava|ta|esta|foi|era|sera)\s+(?:uma\s+)?(?:delicia|delicioso|maravilha|maravilhoso|otimo|otima|excelente|perfeito|perfeita|top|show|bom|boa|gostoso|gostosa|saboroso|saborosa|apetitoso|apetitosa)\b',
+      r'\b(?:gostei|amei|adorei|adoro|amo)\s+(?:muito|demais|bastante)?\b',
+      r'\b(?:muito|super|bem|tao)\s+(?:bom|boa|gostoso|gostosa|delicioso|delicia|maravilha|otimo|otima)\b',
+      r'\b(?:que\s+)?(?:delicia|maravilha|otimo|otima|perfeito|perfeita|top|show)\b',
+      r'\b(?:comida|prato|marmita|almoco|refeicao)\s+(?:otima|otimo|boa|bom|deliciosa|delicioso|maravilhosa|maravilhoso|saborosa|saboroso)\b',
+      r'\b(?:chegou|entrega)\s+(?:rapido|rapida|veloz)\b',
+      r'\b(?:rapido|rapida|veloz)\s+(?:entrega|chegou|demora)\b',
+      r'\b(?:entrega|chegou|demora)\s+(?:rapido|rapida|veloz)\b',
+      r'\b(?:meu|minha|amigo|amiga|irmao|irma|marido|esposa|pai|mae|filho|filha)\s+(?:indicou|recomendou|falou|disse|gostou|adorou|amo)\b',
+      r'\b(?:indicacao|recomendacao)\s+(?:de|do|da)\s+(?:meu|minha|amigo|amiga|irmao|irma|marido|esposa|pai|mae|filho|filha)\b',
+      r'\b(?:falou|disse)\s+(?:que\s+)?(?:era|foi|tava|ta|esta)\s+(?:bom|boa|otimo|otima|delicioso|delicia|maravilha|gostoso|gostosa)\b',
+      r'\b(?:pedi|comprei|comi|experimentei|provei)\s+(?:ontem|hoje|anteontem|semana\s+passada|mes\s+passado|outro\s+dia)\b.*\b(?:tava|estava|foi|era|ta|esta)\s+(?:bom|boa|otimo|otima|delicioso|delicia|maravilha|gostoso|gostosa)\b',
+      r'\b(?:vou|quero|queria|gostaria)\s+(?:pedir|comprar|encomendar)\s+(?:de\s+novo|novamente|outra\s+vez|mais\s+uma)\b',
+      r'\b(?:sempre|todas\s+as\s+vezes)\s+(?:peço|pedido|compro|encomendo)\b',
+      r'\b(?:parabens|pela\s+comida|pelo\s+atendimento|pela\s+entrega)\b',
+      r'\b(?:nota\s+10|nota\s+100|nota\s+1000|5\s+estrelas|5\s+stars)\b',
+      r'\b(?:show|top|perfeito|perfeita|excelente|otimo|otima|maravilha|maravilhoso|maravilhosa)\b',
+      r'\b(?:valeu|obrigado|obrigada|agradeço|agradecido|agradecida)\s+(?:mesm[oa]|demais|bastante)\b',
+      r'\b(?:adorei|amei|gostei)\s+(?:muito|demais|bastante)\b',
+      r'\b(?:muito|super|bem|tao)\s+(?:bom|boa|gostoso|gostosa|delicioso|delicia|maravilha|otimo|otima)\b',
+      r'\b(?:que\s+)?(?:delicia|maravilha|otimo|otima|perfeito|perfeita|top|show)\b',
+      r'\b(?:comida|prato|marmita|almoco|refeicao)\s+(?:otima|otimo|boa|bom|deliciosa|delicioso|maravilhosa|maravilhoso|saborosa|saboroso)\b',
+      r'\b(?:chegou|entrega)\s+(?:rapido|rapida|veloz)\b',
+      r'\b(?:rapido|rapida|veloz)\s+(?:entrega|chegou|demora)\b',
+      r'\b(?:entrega|chegou|demora)\s+(?:rapido|rapida|veloz)\b',
+      r'\b(?:meu|minha|amigo|amiga|irmao|irma|marido|esposa|pai|mae|filho|filha)\s+(?:indicou|recomendou|falou|disse|gostou|adorou|amo)\b',
+      r'\b(?:indicacao|recomendacao)\s+(?:de|do|da)\s+(?:meu|minha|amigo|amiga|irmao|irma|marido|esposa|pai|mae|filho|filha)\b',
+      r'\b(?:falou|disse)\s+(?:que\s+)?(?:era|foi|tava|ta|esta)\s+(?:bom|boa|otimo|otima|delicioso|delicia|maravilha|gostoso|gostosa)\b',
+      r'\b(?:pedi|comprei|comi|experimentei|provei)\s+(?:ontem|hoje|anteontem|semana\s+passada|mes\s+passado|outro\s+dia)\b.*\b(?:tava|estava|foi|era|ta|esta)\s+(?:bom|boa|otimo|otima|delicioso|delicia|maravilha|gostoso|gostosa)\b',
+      r'\b(?:vou|quero|queria|gostaria)\s+(?:pedir|comprar|encomendar)\s+(?:de\s+novo|novamente|outra\s+vez|mais\s+uma)\b',
+      r'\b(?:sempre|todas\s+as\s+vezes)\s+(?:peço|pedido|compro|encomendo)\b',
+      r'\b(?:parabens|pela\s+comida|pelo\s+atendimento|pela\s+entrega)\b',
+      r'\b(?:nota\s+10|nota\s+100|nota\s+1000|5\s+estrelas|5\s+stars)\b',
+      r'\b(?:show|top|perfeito|perfeita|excelente|otimo|otima|maravilha|maravilhoso|maravilhosa)\b',
+      r'\b(?:valeu|obrigado|obrigada|agradeço|agradecido|agradecida)\s+(?:mesm[oa]|demais|bastante)\b',
+      r'\b(?:adorei|amei|gostei)\s+(?:muito|demais|bastante)\b',
+    ];
+    
+    for (final padrao in padroesElogio) {
+      if (RegExp(padrao, caseSensitive: false).hasMatch(texto)) {
+        return true;
+      }
+    }
+    
+    // Verifica palavras-chave de elogio
+    final palavrasElogio = {
+      'delicia', 'delicioso', 'deliciosa', 'maravilha', 'maravilhoso', 'maravilhosa',
+      'otimo', 'otima', 'excelente', 'perfeito', 'perfeita', 'top', 'show',
+      'gostoso', 'gostosa', 'saboroso', 'saborosa', 'apetitoso', 'apetitosa',
+      'rapido', 'rapida', 'veloz', 'indico', 'indicao', 'recomendo', 'recomendacao',
+      'parabens', 'nota10', 'nota100', 'nota1000', '5estrelas', '5stars',
+      'gostei', 'amei', 'adorei', 'adoro', 'amo', 'adorado', 'adorada',
+      'feliz', 'satisfeito', 'satisfeita', 'contente', 'encantado', 'encantada',
+      'surpreendido', 'surpreendida', 'impressionado', 'impressionada',
+    };
+    
+    final palavras = texto.split(RegExp(r'\s+'));
+    for (final palavra in palavras) {
+      final limpa = palavra.replaceAll(RegExp(r'[^a-z]'), '');
+      if (palavrasElogio.contains(limpa)) {
+        return true;
+      }
+    }
+    
+    return false;
+  }
+
+  bool _ehDesistenciaExplicita(String entrada) {
+    final norm = _normalizar(entrada);
+    return RegExp(
+      r'^(?:(?:eu\s+|por favor\s+)?(?:deixa\s+qu[ei]eto|deixa\s+pra\s*l[aã]|n[aã]o\s+vou\s+(?:pedir|querer)(?:\s+mais)?|desist[io](?:mos)?|cancela\s+tudo|esquece(?:r)?|nao\s+quero\s+(?:pedir|querer)|nao\s+vou\s+(?:pedir|querer)|desist[io]\s+do\s+pedido|cancela\s+(?:meu\s+)?pedido|para\s+(?:tudo|com\s+isso)|encerra\s+(?:meu\s+)?pedido|quero\s+encerrar|quero\s+parar|nao\s+quero\s+mais\s+nada|nao\s+quero\s+continuar|quero\s+cancelar\s+(?:meu\s+)?pedido|cancela\s+tudo|esquece(?:r)?)(?:\s+(?:obg|obrigado|obrigada|valeu|pfv|por\s+favor))?)$',
+    ).hasMatch(norm) || _correspondeIntencao(entrada, [
+      'deixa quieto',
+      'deixa queto',
+      'deixa pra la',
+      'nao vou pedir',
+      'nao vou querer',
+      'nao vou querer mais',
+      'desisti',
+      'desistimos',
+      'desisto',
+      'cancela tudo',
+      'esquece',
+      'nao quero pedir',
+      'nao quero querer',
+      'desisto do pedido',
+      'cancela meu pedido',
+      'para tudo',
+      'para com isso',
+      'encerra meu pedido',
+      'quero encerrar',
+      'quero parar',
+      'nao quero mais nada',
+      'nao quero continuar',
+      'quero cancelar meu pedido',
+      'cancela tudo',
+      'esquece',
+      'deixa quieto obg',
+      'deixa quieto obrigado',
+      'deixa quieto obrigada',
+      'deixa quieto valeu',
+      'deixa queto obg',
+      'deixa queto obrigado',
+      'deixa queto obrigada',
+      'deixa queto valeu',
+      'deixa pra la obg',
+      'deixa pra la obrigado',
+      'deixa pra la obrigada',
+      'deixa pra la valeu',
+      'nao vou pedir obg',
+      'nao vou pedir obrigado',
+      'nao vou pedir obrigada',
+      'nao vou pedir valeu',
+      'nao vou querer obg',
+      'nao vou querer obrigado',
+      'nao vou querer obrigada',
+      'nao vou querer valeu',
+      'desisti obg',
+      'desisti obrigado',
+      'desisti obrigada',
+      'desisti valeu',
+      'desisto obg',
+      'desisto obrigado',
+      'desisto obrigada',
+      'desisto valeu',
+      'cancela tudo obg',
+      'cancela tudo obrigado',
+      'cancela tudo obrigada',
+      'cancela tudo valeu',
+      'esquece obg',
+      'esquece obrigado',
+      'esquece obrigada',
+      'esquece valeu',
+    ]);
+  }
 
   bool _ehNegacaoPedido(String entrada) => _corresponde(entrada, [
         'nem pedi nada',
@@ -2828,6 +3200,79 @@ class BotService {
         'esquece o pedido',
         'esquece pedido',
       ]);
+
+  bool _ehReclamacao(String entrada) {
+    final texto = _normalizarIntencao(entrada);
+    final padroesReclamacao = [
+      r'\b(?:nao\s+gostei|ruim|pessimo|pessima|horrivel|horroroso|nojento|nojenta|estragad[oa]|vencid[oa]?\b|gelad[oa]|fri[oa]|morn[oa]|sem\s+sabor|gosto\s+ruim|agua\s+com\s+sabor|gosto\s+de\s+agua|nao\s+e\s+bom|nao\s+e\s+boa|nao\s+recomendo|nao\s+voltarei|nao\s+peço\s+mais|unca\s+mais|jamais\s+mais|que\s+pena|decepcionad[oa]|decepcao|frustrad[oa]|irritad[oa]|chatead[oa]|insatisfeit[oa])\b',
+      r'\b(?:chegou|chegou\s+(?:fri[oa]|morn[oa]|gelad[oa]|atrasad[oa]|errad[oa]|quebrad[oa]|amassad[oa]|derramad[oa]|vazand[oa]|faltou|em\s+falta))\b',
+      r'\b(?:faltou|faltando|nao\s+veio|nao\s+chegou|errad[oa]|trocad[oa]|diferente)\b.*\b(?:pedido|item|comida|marmita|entrega)\b',
+      r'\b(?:entrega|entregador|motoboy|demora|demorou|atraso|atrasad[oa])\b.*\b(?:muito|demorad[oa]|atrasad[oa]|late|slow)\b',
+      r'\b(?:preco|valor|custo)\b.*\b(?:alto|caro|absurdo|exorbitante|abusivo)\b',
+      r'\b(?:atendimento|atendente|servico)\b.*\b(?:ruim|pessimo|pessima|horrivel|lento|demorado)\b',
+    ];
+    for (final padrao in padroesReclamacao) {
+      if (RegExp(padrao, caseSensitive: false).hasMatch(texto)) {
+        return true;
+      }
+    }
+    final palavrasReclamacao = {
+      'ruim', 'pessimo', 'pessima', 'horrivel', 'nojento', 'nojenta',
+      'estragado', 'estragada', 'vencido', 'vencida', 'gelado', 'gelada',
+      'frio', 'fria', 'morno', 'morna', 'sem_sabor', 'gosto_ruim',
+      'nao_recomendo', 'nao_voltarei', 'unca_mais', 'jamais_mais',
+      'pena', 'decepcionado', 'decepcionada', 'decepcao', 'frustrado',
+      'frustrada', 'irritado', 'irritada', 'chateado', 'chateada',
+      'insatisfeito', 'insatisfeita', 'atrasado', 'atrasada', 'demorado',
+      'demorada', 'lento', 'lenta', 'caro', 'carissimo', 'abusivo',
+    };
+    final palavras = texto.split(RegExp(r'\s+'));
+    for (final palavra in palavras) {
+      final limpa = palavra.replaceAll(RegExp(r'[^a-z_]'), '');
+      if (palavrasReclamacao.contains(limpa)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool _ehIndecisao(String entrada) {
+    final texto = _normalizarIntencao(entrada);
+    final padroesIndecisao = [
+      r'\b(?:nao\s+sei|n\s+sei|sei\s+la|sei\s+la\s+oq|nao\s+tenho\s+certeza|estou\s+em\s+duvida|estou\s+duvidoso|estou\s+duvidosa|nao\s+decidi|nao\s+decidir|nao\s+con\s+decidir|nao\s+sei\s+oq|nao\s+sei\s+qual|nao\s+sei\s+oq\s+pedir|nao\s+sei\s+oq\s+querer|nao\s+sei\s+oq\s+escolher|nao\s+sei\s+oq\s+fazer|nao\s+sei\s+oq\s+comer|nao\s+sei\s+oq\s+levar|nao\s+sei\s+oq\s+pegar|nao\s+sei\s+oq\s+comprar|nao\s+sei\s+oq\s+encomendar|nao\s+sei\s+oq\s+montar|nao\s+sei\s+oq\s+fazer|nao\s+sei\s+oq\s+pedir)\b',
+      r'\b(?:ajuda|ajudar|me\s+ajuda|me\s+ajudar|pode\s+ajudar|poderia\s+ajudar|consegue\s+ajudar|sugestao|sugestoes|sugere|sugerir|recomenda|recomendar|recomendacao|recomendacoes|dica|dicas|opcao|opcoes|escolha|escolher)\b',
+      r'\b(?:qual\s+(?:voce|voces|vc|vcs)\s+(?:recomenda|sugere|acha|acham|sugestao|recomendacao|dica|dicas|opcao|opcoes|escolha|escolher|melhor|mais\s+pedido|mais\s+vendido|mais\s+popular|mais\s+gostoso|mais\s+bom|mais\s+barato|mais\s+em\s+conta|mais\s+rapido|mais\s+pratico|mais\s+saudavel|mais\s+leve|mais\s+forte|mais\s+fraco|mais\s+encorpado|mais\s+saboroso|mais\s+gostoso|mais\s+bom|mais\s+barato|mais\s+em\s+conta|mais\s+rapido|mais\s+pratico|mais\s+saudavel|mais\s+leve|mais\s+forte|mais\s+fraco|mais\s+encorpado|mais\s+saboroso))\b',
+      r'\b(?:qual\s+(?:o\s+)?melhor|qual\s+(?:o\s+)?mais\s+pedido|qual\s+(?:o\s+)?mais\s+vendido|qual\s+(?:o\s+)?mais\s+popular|qual\s+(?:o\s+)?mais\s+gostoso|qual\s+(?:o\s+)?mais\s+bom|qual\s+(?:o\s+)?mais\s+barato|qual\s+(?:o\s+)?mais\s+em\s+conta|qual\s+(?:o\s+)?mais\s+rapido|qual\s+(?:o\s+)?mais\s+pratico|qual\s+(?:o\s+)?mais\s+saudavel|qual\s+(?:o\s+)?mais\s+leve|qual\s+(?:o\s+)?mais\s+forte|qual\s+(?:o\s+)?mais\s+fraco|qual\s+(?:o\s+)?mais\s+encorpado|qual\s+(?:o\s+)?mais\s+saboroso)\b',
+      r'\b(?:oq\s+(?:voce|voces|vc|vcs)\s+(?:recomenda|sugere|acha|acham|sugestao|recomendacao|dica|dicas|opcao|opcoes|escolha|escolher|melhor|mais\s+pedido|mais\s+vendido|mais\s+popular|mais\s+gostoso|mais\s+bom|mais\s+barato|mais\s+em\s+conta|mais\s+rapido|mais\s+pratico|mais\s+saudavel|mais\s+leve|mais\s+forte|mais\s+fraco|mais\s+encorpado|mais\s+saboroso))\b',
+      r'\b(?:nao\s+sei\s+oq\s+pedir|nao\s+sei\s+oq\s+querer|nao\s+sei\s+oq\s+escolher|nao\s+sei\s+oq\s+fazer|nao\s+sei\s+oq\s+comer|nao\s+sei\s+oq\s+levar|nao\s+sei\s+oq\s+pegar|nao\s+sei\s+oq\s+comprar|nao\s+sei\s+oq\s+encomendar|nao\s+sei\s+oq\s+montar|nao\s+sei\s+oq\s+fazer|nao\s+sei\s+oq\s+pedir)\b',
+    ];
+    for (final padrao in padroesIndecisao) {
+      if (RegExp(padrao, caseSensitive: false).hasMatch(texto)) {
+        return true;
+      }
+    }
+    final palavrasIndecisao = {
+      'nao_sei', 'sei_la', 'duvida', 'duvidoso', 'duvidosa', 'nao_decidi',
+      'ajuda', 'ajudar', 'sugestao', 'sugestoes', 'sugere', 'sugerir',
+      'recomenda', 'recomendar', 'recomendacao', 'recomendacoes', 'dica', 'dicas',
+      'opcao', 'opcoes', 'escolha', 'escolher', 'melhor', 'mais_pedido',
+      'mais_vendido', 'mais_popular', 'mais_gostoso', 'mais_bom', 'mais_barato',
+      'mais_em_conta', 'mais_rapido', 'mais_pratico', 'mais_saudavel', 'mais_leve',
+      'mais_forte', 'mais_fraco', 'mais_encorpado', 'mais_saboroso',
+    };
+    final palavras = texto.split(RegExp(r'\s+'));
+    for (final palavra in palavras) {
+      final limpa = palavra.replaceAll(RegExp(r'[^a-z_]'), '');
+      if (palavrasIndecisao.contains(limpa)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool _ehSaudacaoSimples(String entrada) => RegExp(
+        r'^(?:(?:oi+|ola|oie|opa|salve|e ai|eae|opa|opa|bom dia|boa tarde|boa noite|tudo bem|tudo bom|tudo certo|tudo joia|tudo otimo|como vai|como ta|como\s+esta|como\s+estan|blz|beleza|joinha|joia|show|top|valeu|obrigado|obrigada|obg|obgd|agradeco|agradecido|agradecida)(?:\s+(?:oi+|ola|oie|opa|salve|e ai|eae|opa|opa|bom dia|boa tarde|boa noite|tudo bem|tudo bom|tudo certo|tudo joia|tudo otimo|como vai|como ta|como\s+esta|como\s+estan|blz|beleza|joinha|joia|show|top|valeu|obrigado|obrigada|obg|obgd|agradeco|agradecido|agradecida))*)$',
+      ).hasMatch(_normalizar(entrada));
 
   Future<void> _continuar(
     MensagemWhatsApp msg,
@@ -7351,12 +7796,9 @@ class BotService {
     ]);
   }
 
-  Future<void> _responderAjuda(
-    MensagemWhatsApp msg,
-    Map<String, dynamic>? sessao,
-  ) async {
+  String _textoAjudaEtapa(Map<String, dynamic>? sessao) {
     final etapa = sessao?['etapa']?.toString() ?? 'inicio';
-    final orientacao = switch (etapa) {
+    return switch (etapa) {
       'tamanho' => _modoIaAtivo
           ? 'Qual tamanho você prefere?'
           : 'Escolha o tamanho da marmita na lista.',
@@ -7410,6 +7852,13 @@ class BotService {
           ? 'Como posso ajudar?'
           : 'Escolha uma das opções exibidas para começar.',
     };
+  }
+
+  Future<void> _responderAjuda(
+    MensagemWhatsApp msg,
+    Map<String, dynamic>? sessao,
+  ) async {
+    final orientacao = _textoAjudaEtapa(sessao);
     await whatsapp.enviarTexto(
       msg.telefone,
       _modoIaAtivo
