@@ -24,6 +24,7 @@ class BotService {
       var mensagemProcessada = msg;
       String? respostaIA;
       Map<String, dynamic>? pedidoIA;
+      String? motivoTransferenciaIA;
       try {
         final sessaoAtual = banco.obterSessao(msg.telefone);
         final bebidaNoResumo = _modoIaAtivo &&
@@ -40,8 +41,20 @@ class BotService {
         } else {
           final interpretacao = await _interpretarComIA(msg);
           if (interpretacao != null) {
+            banco.log(
+              'INFO',
+              'ia_interpretacao',
+              'etapa=${banco.obterSessao(msg.telefone)?['etapa'] ?? 'inicio'};'
+                  'tipo=${interpretacao.tipo};'
+                  'motivo=${interpretacao.motivoHumano ?? ''};'
+                  'tamanho=${msg.entrada.length}',
+            );
             if (interpretacao.tipo == 'pedido') {
               pedidoIA = interpretacao.pedido;
+            } else if (interpretacao.tipo == 'humano') {
+              motivoTransferenciaIA =
+                  interpretacao.motivoHumano ?? 'duvida_nao_respondida';
+              respostaIA = interpretacao.texto;
             } else if (interpretacao.tipo == 'escolha') {
               mensagemProcessada = MensagemWhatsApp(
                 id: msg.id,
@@ -63,6 +76,15 @@ class BotService {
             e is HttpExceptionSeguro ? e.message : e.runtimeType.toString();
         banco.log('WARN', 'ia_indisponivel_fallback_bot', detalhe);
       }
+      if (motivoTransferenciaIA != null) {
+        banco.definirModoHumano(
+          msg.telefone,
+          true,
+          preservarDados: true,
+          origem: 'ia',
+          motivo: motivoTransferenciaIA,
+        );
+      }
       banco.db.execute('BEGIN IMMEDIATE');
       try {
         await _processarInterno(
@@ -70,8 +92,12 @@ class BotService {
           respostaIA: respostaIA,
           pedidoIA: pedidoIA,
         );
+        _registrarHistoricoIa(msg);
         banco.db.execute('DELETE FROM webhook_entrada WHERE id = ?', [msg.id]);
         banco.db.execute('COMMIT');
+        if (motivoTransferenciaIA != null && respostaIA != null) {
+          await whatsapp.enviarTexto(msg.telefone, respostaIA);
+        }
       } catch (e) {
         banco.db.execute('ROLLBACK');
         banco.log('ERROR', 'bot_transacao_desfeita', e.runtimeType.toString());
@@ -80,6 +106,36 @@ class BotService {
     });
     _fila = atual;
     return atual;
+  }
+
+  void _registrarHistoricoIa(MensagemWhatsApp msg) {
+    if (msg.entrada.isEmpty) return;
+    final sessao = banco.obterSessao(msg.telefone);
+    if (sessao == null || sessao['modoHumano'] == true) return;
+    final dados = Map<String, dynamic>.from(sessao['dados'] as Map? ?? {});
+    final historico = (dados['historicoIa'] as List? ?? const [])
+        .whereType<Map>()
+        .map((item) => Map<String, dynamic>.from(item))
+        .toList();
+    historico.add({
+      'texto': _sanitizarMensagemParaIa(msg.entrada).substring(
+        0,
+        _sanitizarMensagemParaIa(msg.entrada).length.clamp(0, 240),
+      ),
+      'etapa': sessao['etapa']?.toString() ?? 'inicio',
+      'em': agoraIso(),
+    });
+    if (historico.length > 6) {
+      historico.removeRange(0, historico.length - 6);
+    }
+    dados['historicoIa'] = historico;
+    banco.salvarSessao(
+      telefone: msg.telefone,
+      nome: sessao['nome'] as String?,
+      etapa: sessao['etapa']?.toString() ?? 'inicio',
+      dados: dados,
+      modoHumano: false,
+    );
   }
 
   Future<void> retomarAtendimentoHumano(String telefone) async {
@@ -430,6 +486,8 @@ class BotService {
       'fluxoFeijaoAtivo': cardapio['fluxoFeijaoAtivo'] == true,
       'rascunhoPedidoAtual':
           (sessao?['dados'] as Map?)?['rascunhoPedidoIA'] ?? const {},
+      'historicoRecente':
+          (sessao?['dados'] as Map?)?['historicoIa'] ?? const [],
       'etapaAtual': etapa,
       'opcoesDaEtapa': _opcoesEtapaIA(etapa, sessao, config),
     };
@@ -1036,7 +1094,7 @@ class BotService {
       } else if ((totalMarmitas ?? 0) > 1) {
         await whatsapp.enviarTexto(
           msg.telefone,
-          'Vamos montar a primeira marmita. Quais tamanhos você prefere para as $totalMarmitas marmitas?',
+          'Vamos montar suas marmitas. Quais tamanhos você prefere?',
         );
       } else {
         await whatsapp.enviarTexto(
@@ -1109,15 +1167,17 @@ class BotService {
             ? (rascunho['quantidadeTotalSolicitada'] as num).toInt()
             : null;
         final pergunta = itens.length == 1 && (totalMarmitas ?? 0) > 1
-            ? 'Quais tamanhos você prefere para as $totalMarmitas marmitas?'
+            ? 'Quais tamanhos você prefere?'
             : itens.length == 1
-                ? 'Qual tamanho você prefere para sua marmita?'
+                ? _perguntaDetalhesPrimeiraMarmita(cardapio)
                 : 'Qual tamanho você prefere para a próxima marmita?';
-        perguntaPendente = _perguntaOpcaoIA(
-          pergunta,
-          _itensAtivos(cardapio, 'tamanhos'),
-          'tamanho',
-        );
+        perguntaPendente = itens.length == 1 && (totalMarmitas ?? 0) <= 1
+            ? pergunta
+            : _perguntaOpcaoIA(
+                pergunta,
+                _itensAtivos(cardapio, 'tamanhos'),
+                'tamanho',
+              );
       } else if (arrozAtivo && arroz == null) {
         final referencia = _referenciaMarmitaIa(
           itens,
@@ -1144,7 +1204,7 @@ class BotService {
         item['misturas'] = <String>[];
         item['mistura'] = null;
         perguntaPendente = _perguntaOpcaoIA(
-          'Essa marmita leva $quantidadeMisturas mistura(s). Quais você prefere?',
+          'Quais misturas você prefere?',
           _itensAtivos(cardapio, 'misturas'),
           'mistura',
         );
@@ -1160,8 +1220,7 @@ class BotService {
             .toList();
         final pergunta = quantidadeMisturas == 1
             ? 'Qual mistura você prefere $referencia?'
-            : 'Qual outra mistura você prefere $referencia? '
-                '(${misturas.length + 1} de $quantidadeMisturas)';
+            : 'Qual outra mistura você prefere $referencia?';
         perguntaPendente = _perguntaOpcaoIA(
           pergunta,
           restantes,
@@ -1171,7 +1230,7 @@ class BotService {
         item['acompanhamentos'] = <String>[];
         item['acompanhamento'] = null;
         perguntaPendente = _perguntaOpcaoIA(
-          'Essa marmita leva $quantidadeAcompanhamentos acompanhamento(s). Quais você prefere?',
+          'Quais acompanhamentos você prefere?',
           _itensAtivos(cardapio, 'acompanhamentos'),
           'acompanhamento',
         );
@@ -1187,8 +1246,7 @@ class BotService {
             .toList();
         final pergunta = quantidadeAcompanhamentos == 1
             ? 'Qual acompanhamento você prefere $referencia?'
-            : 'Qual outro acompanhamento você prefere $referencia? '
-                '(${acompanhamentos.length + 1} de $quantidadeAcompanhamentos)';
+            : 'Qual outro acompanhamento você prefere $referencia?';
         perguntaPendente = _perguntaOpcaoIA(
           pergunta,
           restantes,
@@ -1298,6 +1356,11 @@ class BotService {
     }
   }
 
+  String _perguntaDetalhesPrimeiraMarmita(Map<String, dynamic> cardapio) {
+    final tamanhos = _itensAtivos(cardapio, 'tamanhos');
+    return 'Qual será o tamanho, a mistura${tamanhos.any((item) => (item['quantidadeMisturas'] as num? ?? 1) > 1) ? '(ou misturas)' : ''} e o acompanhamento?';
+  }
+
   bool _rascunhoItemCompleto(
     Map<String, dynamic> item, {
     required bool arrozAtivo,
@@ -1369,6 +1432,14 @@ class BotService {
             (item) => _normalizar(item['nome']?.toString() ?? '') == procurada)
         .toList();
     if (exatas.length == 1) return exatas.single;
+    final aliases = opcoes.where((item) {
+      final lista = item['aliases'];
+      return lista is List &&
+          lista.any(
+            (alias) => _normalizar(alias.toString()) == procurada,
+          );
+    }).toList();
+    if (aliases.length == 1) return aliases.single;
     final palavrasEntrada = procurada.split(' ');
     if (palavrasEntrada.length > 4 ||
         palavrasEntrada.any((palavra) => const {
@@ -1390,9 +1461,9 @@ class BotService {
       return prefixos.length == 1 ? prefixos.single : null;
     }
 
-    // Uma palavra só pode selecionar por prefixo ou por uma abreviação curta
-    // com distância de edição 1; frases que apenas mencionam um prato não
-    // contam como escolha.
+    // Uma palavra só pode selecionar por prefixo ou por erro de digitação
+    // pequeno. Para nomes longos permitimos duas edições, mas somente quando
+    // existe um único candidato claramente melhor.
     if (procurada.length < 4) return null;
     final prefixos = opcoes.where((item) {
       final nome = _normalizar(item['nome']?.toString() ?? '');
@@ -1402,6 +1473,7 @@ class BotService {
     if (prefixos.length > 1) return null;
 
     final distancias = <(Map<String, dynamic>, int)>[];
+    final limiteDistancia = procurada.length >= 7 ? 2 : 1;
     for (final item in opcoes) {
       final nome = _normalizar(item['nome']?.toString() ?? '');
       final palavrasNome = nome.split(' ');
@@ -1409,7 +1481,9 @@ class BotService {
       for (final candidata in palavrasNome) {
         if (candidata.length < 5) continue;
         final distancia = _distanciaEdicao(procurada, candidata);
-        if (distancia == 1 && distancia < melhor) melhor = distancia;
+        if (distancia <= limiteDistancia && distancia < melhor) {
+          melhor = distancia;
+        }
       }
       if (melhor < 999) distancias.add((item, melhor));
     }
@@ -2155,6 +2229,49 @@ class BotService {
         banco.finalizarMensagem(msg.id);
         return;
       }
+      if (msg.temLocalizacao) {
+        final dadosLocalizacao =
+            Map<String, dynamic>.from(sessao?['dados'] as Map? ?? {});
+        dadosLocalizacao['ultimaLocalizacao'] = {
+          'latitude': msg.latitude,
+          'longitude': msg.longitude,
+          'recebidaEm': agoraIso(),
+        };
+        banco.salvarSessao(
+          telefone: msg.telefone,
+          nome: msg.nome,
+          etapa: sessao?['etapa']?.toString() ?? 'inicio',
+          dados: dadosLocalizacao,
+        );
+        if (sessao?['etapa'] == 'endereco') {
+          await whatsapp.enviarTexto(
+            msg.telefone,
+            'Recebi sua localização. Para confirmar a entrega, envie também o endereço com rua, número e bairro.',
+          );
+        } else {
+          await whatsapp.enviarTexto(
+            msg.telefone,
+            'Recebi sua localização. Quando formos confirmar a entrega, vou precisar também do endereço escrito.',
+          );
+        }
+        banco.finalizarMensagem(msg.id);
+        return;
+      }
+      if (msg.ehMidia && msg.entrada.isEmpty) {
+        banco.definirModoHumano(
+          msg.telefone,
+          true,
+          preservarDados: true,
+          origem: 'ia',
+          motivo: 'midia_nao_processada',
+        );
+        await whatsapp.enviarTexto(
+          msg.telefone,
+          'Recebi sua mídia, mas não consegui interpretá-la automaticamente. Encaminhei a conversa para um atendente.',
+        );
+        banco.finalizarMensagem(msg.id);
+        return;
+      }
       final resposta = msg.entrada;
       if (resposta.contains('|')) {
         final partes = resposta.split('|');
@@ -2223,7 +2340,7 @@ class BotService {
       // confirmação, não a de agradecimento/desistência genérica.
       final etapaAtual = sessao?['etapa']?.toString() ?? 'inicio';
       final ehConfirmacao = etapaAtual == 'confirmacao';
-      
+
       if (_modoIaAtivo && _ehDesistenciaExplicita(entrada)) {
         // Na confirmação, desistência explícita remove os itens do pedido
         if (ehConfirmacao) {
@@ -2251,7 +2368,9 @@ class BotService {
         return;
       }
       if (_modoIaAtivo && _ehAgradecimentoSimples(entrada) && !ehConfirmacao) {
-        if (sessao != null && sessao['etapa'] != 'inicio' && _estadoEfetivo(config) == 'atendendo') {
+        if (sessao != null &&
+            sessao['etapa'] != 'inicio' &&
+            _estadoEfetivo(config) == 'atendendo') {
           await whatsapp.enviarTexto(
             msg.telefone,
             'Por nada! 😊 ${_textoAjudaEtapa(sessao)}',
@@ -2266,10 +2385,14 @@ class BotService {
         banco.finalizarMensagem(msg.id);
         return;
       }
-      if (_modoIaAtivo && _ehElogioOuComentarioPositivo(entrada) && !ehConfirmacao) {
+      if (_modoIaAtivo &&
+          _ehElogioOuComentarioPositivo(entrada) &&
+          !ehConfirmacao) {
         // Elogios não alteram o estado do pedido. Responde cordialmente e,
         // se houver pedido em andamento, continua de onde parou.
-        if (sessao != null && sessao['etapa'] != 'inicio' && _estadoEfetivo(config) == 'atendendo') {
+        if (sessao != null &&
+            sessao['etapa'] != 'inicio' &&
+            _estadoEfetivo(config) == 'atendendo') {
           await whatsapp.enviarTexto(
             msg.telefone,
             'Que bom que você gostou! A Ao Ponto agradece o carinho 😊 ${_textoAjudaEtapa(sessao)}',
@@ -2284,26 +2407,40 @@ class BotService {
         return;
       }
       if (_modoIaAtivo && _ehReclamacao(entrada) && !ehConfirmacao) {
-        // Reclamações não alteram o estado do pedido. Responde com empatia e,
-        // se houver pedido em andamento, continua de onde parou.
-        if (sessao != null && sessao['etapa'] != 'inicio' && _estadoEfetivo(config) == 'atendendo') {
+        // Reclamações passam para um atendente, preservando o pedido em andamento.
+        banco.definirModoHumano(
+          msg.telefone,
+          true,
+          preservarDados: true,
+          origem: 'ia',
+          motivo:
+              _ehReclamacaoGrave(entrada) ? 'reclamacao_grave' : 'reclamacao',
+        );
+        if (sessao != null &&
+            sessao['etapa'] != 'inicio' &&
+            _estadoEfetivo(config) == 'atendendo') {
           await whatsapp.enviarTexto(
             msg.telefone,
-            'Lamento muito pela experiência! Vou anotar seu feedback e encaminhar para a equipe. 😔 ${_textoAjudaEtapa(sessao)}',
+            'Lamento muito pela experiência! 😔 Encaminhei sua conversa para um atendente, que vai verificar isso com você.',
           );
         } else {
           await whatsapp.enviarTexto(
             msg.telefone,
-            'Lamento muito pela experiência! Vou anotar seu feedback e encaminhar para a equipe. Se quiser, posso ajudar com um novo pedido.',
+            'Lamento muito pela experiência! 😔 Encaminhei sua conversa para um atendente, que vai verificar isso com você.',
           );
         }
         banco.finalizarMensagem(msg.id);
         return;
       }
-      if (_modoIaAtivo && _ehIndecisao(entrada) && !ehConfirmacao && etapaAtual != 'cidade_entrega') {
+      if (_modoIaAtivo &&
+          _ehIndecisao(entrada) &&
+          !ehConfirmacao &&
+          etapaAtual != 'cidade_entrega') {
         // Indecisão não altera o estado do pedido. Ajuda o cliente a escolher.
         // Não interfere na etapa de cidade_entrega, onde "nao sei ainda" é uma resposta válida.
-        if (sessao != null && sessao['etapa'] != 'inicio' && _estadoEfetivo(config) == 'atendendo') {
+        if (sessao != null &&
+            sessao['etapa'] != 'inicio' &&
+            _estadoEfetivo(config) == 'atendendo') {
           await whatsapp.enviarTexto(
             msg.telefone,
             'Sem problemas! Posso ajudar você a escolher. ${_textoAjudaEtapa(sessao)}',
@@ -2314,7 +2451,10 @@ class BotService {
               .where((e) => (e as Map)['ativo'] == true)
               .toList();
           if (misturas.isNotEmpty) {
-            final sugestoes = misturas.take(3).map((e) => '• ${(e as Map)['nome']}').join('\n');
+            final sugestoes = misturas
+                .take(3)
+                .map((e) => '• ${(e as Map)['nome']}')
+                .join('\n');
             await whatsapp.enviarTexto(
               msg.telefone,
               'Claro! Aqui estão algumas sugestões populares:\n$sugestoes\n\nQual delas te agrada mais?',
@@ -2409,7 +2549,8 @@ class BotService {
         if (sessao == null && config['modoAtendimento'] == 'ia') {
           await whatsapp.enviarTexto(msg.telefone, _saudacaoIa());
         }
-        banco.definirModoHumano(msg.telefone, true);
+        banco.definirModoHumano(msg.telefone, true,
+            origem: 'cliente', motivo: 'solicitacao_explicita');
         await whatsapp.enviarTexto(
           msg.telefone,
           _textoFluxo('sistema', 'humanoAtivado',
@@ -2944,105 +3085,221 @@ class BotService {
     return texto.replaceAll(RegExp(r'\s+'), ' ').trim();
   }
 
-
-
   bool _ehAgradecimentoSimples(String entrada) {
-    final norm = _normalizar(entrada).replaceAll(RegExp(r'[^a-z\s]'), '').trim();
+    final norm =
+        _normalizar(entrada).replaceAll(RegExp(r'[^a-z\s]'), '').trim();
     if (norm.isEmpty) return false;
     final words = norm.split(RegExp(r'\s+'));
     final validWords = {
-      'ok', 'ta', 'bom', 'tabom', 'beleza', 'blz', 'joia', 'maravilha', 'show',
-      'valeu', 'vlw', 'obrigado', 'obrigada', 'obg', 'obgd', 'agradeco', 'agradecido',
-      'agradecida', 'obrigadinho', 'obrigadinha', 'valeuzinho', 'valeuzinha',
-      'agradecimento', 'agradecimentos', 'obrigacoes', 'obrigacao',
-      'valeumesmo', 'obrigadomesmo', 'obrigadamesmo',
-      'muitobrigado', 'muitobrigada', 'muitissimoobrigado', 'muitissimoobrigada',
-      'obrigadopelaajuda', 'obrigadapelaajuda', 'obrigadopelaatencao', 'obrigadapelaatencao',
-      'valeupelaajuda', 'valeupelaatencao', 'agradecopelaajuda', 'agradecopelaatencao',
-      'obrigadopeloatendimento', 'obrigadapeloatendimento',
-      'valeupeloatendimento', 'agradecopeloatendimento',
-      'obrigadopelacomida', 'obrigadapelacomida',
-      'valeupelacomida', 'agradecopelacomida',
-      'obrigadopelaentrega', 'obrigadapelaentrega',
-      'valeupelaentrega', 'agradecopelaentrega',
-      'obrigadopeloservico', 'obrigadapeloservico',
-      'valeupeloservico', 'agradecopeloservico',
-      'obrigadopelacarinho', 'obrigadapelacarinho',
-      'valeupelacarinho', 'agradecopelacarinho',
-      'obrigadopelapreferencia', 'obrigadapelapreferencia',
-      'valeupelapreferencia', 'agradecopelapreferencia',
-      'obrigadopelaconfianca', 'obrigadapelaconfianca',
-      'valeupelaconfianca', 'agradecopelaconfianca',
-      'obrigadopelaoportunidade', 'obrigadapelaoportunidade',
-      'valeupelaoportunidade', 'agradecopelaoportunidade',
-      'obrigadopelaparceria', 'obrigadapelaparceria',
-      'valeupelaparceria', 'agradecopelaparceria',
-      'obrigadopelaamizade', 'obrigadapelaamizade',
-      'valeupelaamizade', 'agradecopelaamizade',
-      'obrigadopelacompanhia', 'obrigadapelacompanhia',
-      'valeupelacompanhia', 'agradecopelacompanhia',
-      'obrigadopelapresenca', 'obrigadapelapresenca',
-      'valeupelapresenca', 'agradecopelapresenca',
-      'obrigadopelavisita', 'obrigadapelavisita',
-      'valeupelavisita', 'agradecopelavisita',
-      'obrigadopelocontato', 'obrigadapelocontato',
-      'valeupelocontato', 'agradecopelocontato',
-      'obrigadopeloretorno', 'obrigadapeloretorno',
-      'valeupeloretorno', 'agradecopeloretorno',
-      'obrigadopeladedicacao', 'obrigadapeladedicacao',
-      'valeupeladedicacao', 'agradecopeladedicacao',
-      'obrigadopeloempenho', 'obrigadapeloempenho',
-      'valeupeloempenho', 'agradecopeloempenho',
-      'obrigadopeloprofissionalismo', 'obrigadapeloprofissionalismo',
-      'valeupeloprofissionalismo', 'agradecopeloprofissionalismo',
-      'obrigadopelqualidade', 'obrigadapelqualidade',
-      'valeupelqualidade', 'agradecopelqualidade',
-      'obrigadopelosabor', 'obrigadapelosabor',
-      'valeupelosabor', 'agradecopelosabor',
-      'obrigadopelotempero', 'obrigadapelotempero',
-      'valeupelotempero', 'agradecopelotempero',
-      'obrigadopelocapricho', 'obrigadapelocapricho',
-      'valeupelocapricho', 'agradecopelocapricho',
-      'obrigadopelocuidado', 'obrigadapelocuidado',
-      'valeupelocuidado', 'agradecopelocuidado',
-      'obrigadopelozelo', 'obrigadapelozelo',
-      'valeupelozelo', 'agradecopelozelo',
-      'obrigadopelocomprometimento', 'obrigadapelocomprometimento',
-      'valeupelocomprometimento', 'agradecopelocomprometimento',
-      'obrigadopelaseriedade', 'obrigadapelaseriedade',
-      'valeupelaseriedade', 'agradecopelaseriedade',
-      'obrigadopelahonestidade', 'obrigadapelahonestidade',
-      'valeupelahonestidade', 'agradecopelahonestidade',
-      'obrigadopelatransparencia', 'obrigadapelatransparencia',
-      'valeupelatransparencia', 'agradecopelatransparencia',
-      'obrigadopelaclareza', 'obrigadapelaclareza',
-      'valeupelaclareza', 'agradecopelaclareza',
-      'obrigadopelaobjetividade', 'obrigadapelaobjetividade',
-      'valeupelaobjetividade', 'agradecopelaobjetividade',
-      'obrigadopelaeficiencia', 'obrigadapelaeficiencia',
-      'valeupelaeficiencia', 'agradecopelaeficiencia',
-      'obrigadopelaagilidade', 'obrigadapelaagilidade',
-      'valeupelaagilidade', 'agradecopelaagilidade',
-      'obrigadopelapontualidade', 'obrigadapelapontualidade',
-      'valeupelapontualidade', 'agradecopelapontualidade',
-      'obrigadopelarapidez', 'obrigadapelarapidez',
-      'valeupelarapidez', 'agradecopelarapidez',
-      'obrigadopelapresteza', 'obrigadapelapresteza',
-      'valeupelapresteza', 'agradecopelapresteza',
-      'obrigadopelasolicitude', 'obrigadapelasolicitude',
-      'valeupelasolicitude', 'agradecopelasolicitude',
-      'obrigadopelagentileza', 'obrigadapelagentileza',
-      'valeupelagentileza', 'agradecopelagentileza',
-      'obrigadopelasimpatia', 'obrigadapelasimpatia',
-      'valeupelasimpatia', 'agradecopelasimpatia',
-      'obrigadopelaeducacao', 'obrigadapelaeducacao',
-      'valeupelaeducacao', 'agradecopelaeducacao',
-      'obrigadopelacordialidade', 'obrigadapelacordialidade',
-      'valeupelacordialidade', 'agradecopelacordialidade',
-      'obrigadopelahospitalidade', 'obrigadapelahospitalidade',
-      'valeupelahospitalidade', 'agradecopelahospitalidade',
-      'obrigadopelareceptividade', 'obrigadapelareceptividade',
-      'valeupelareceptividade', 'agradecopelareceptividade',
+      'ok',
+      'ta',
+      'bom',
+      'tabom',
+      'beleza',
+      'blz',
+      'joia',
+      'maravilha',
+      'show',
+      'valeu',
+      'vlw',
+      'obrigado',
+      'obrigada',
+      'obg',
+      'obgd',
+      'agradeco',
+      'agradecido',
+      'agradecida',
+      'obrigadinho',
+      'obrigadinha',
+      'valeuzinho',
+      'valeuzinha',
+      'agradecimento',
+      'agradecimentos',
+      'obrigacoes',
+      'obrigacao',
+      'valeumesmo',
+      'obrigadomesmo',
+      'obrigadamesmo',
+      'muitobrigado',
+      'muitobrigada',
+      'muitissimoobrigado',
+      'muitissimoobrigada',
+      'obrigadopelaajuda',
+      'obrigadapelaajuda',
+      'obrigadopelaatencao',
+      'obrigadapelaatencao',
+      'valeupelaajuda',
+      'valeupelaatencao',
+      'agradecopelaajuda',
+      'agradecopelaatencao',
+      'obrigadopeloatendimento',
+      'obrigadapeloatendimento',
+      'valeupeloatendimento',
+      'agradecopeloatendimento',
+      'obrigadopelacomida',
+      'obrigadapelacomida',
+      'valeupelacomida',
+      'agradecopelacomida',
+      'obrigadopelaentrega',
+      'obrigadapelaentrega',
+      'valeupelaentrega',
+      'agradecopelaentrega',
+      'obrigadopeloservico',
+      'obrigadapeloservico',
+      'valeupeloservico',
+      'agradecopeloservico',
+      'obrigadopelacarinho',
+      'obrigadapelacarinho',
+      'valeupelacarinho',
+      'agradecopelacarinho',
+      'obrigadopelapreferencia',
+      'obrigadapelapreferencia',
+      'valeupelapreferencia',
+      'agradecopelapreferencia',
+      'obrigadopelaconfianca',
+      'obrigadapelaconfianca',
+      'valeupelaconfianca',
+      'agradecopelaconfianca',
+      'obrigadopelaoportunidade',
+      'obrigadapelaoportunidade',
+      'valeupelaoportunidade',
+      'agradecopelaoportunidade',
+      'obrigadopelaparceria',
+      'obrigadapelaparceria',
+      'valeupelaparceria',
+      'agradecopelaparceria',
+      'obrigadopelaamizade',
+      'obrigadapelaamizade',
+      'valeupelaamizade',
+      'agradecopelaamizade',
+      'obrigadopelacompanhia',
+      'obrigadapelacompanhia',
+      'valeupelacompanhia',
+      'agradecopelacompanhia',
+      'obrigadopelapresenca',
+      'obrigadapelapresenca',
+      'valeupelapresenca',
+      'agradecopelapresenca',
+      'obrigadopelavisita',
+      'obrigadapelavisita',
+      'valeupelavisita',
+      'agradecopelavisita',
+      'obrigadopelocontato',
+      'obrigadapelocontato',
+      'valeupelocontato',
+      'agradecopelocontato',
+      'obrigadopeloretorno',
+      'obrigadapeloretorno',
+      'valeupeloretorno',
+      'agradecopeloretorno',
+      'obrigadopeladedicacao',
+      'obrigadapeladedicacao',
+      'valeupeladedicacao',
+      'agradecopeladedicacao',
+      'obrigadopeloempenho',
+      'obrigadapeloempenho',
+      'valeupeloempenho',
+      'agradecopeloempenho',
+      'obrigadopeloprofissionalismo',
+      'obrigadapeloprofissionalismo',
+      'valeupeloprofissionalismo',
+      'agradecopeloprofissionalismo',
+      'obrigadopelqualidade',
+      'obrigadapelqualidade',
+      'valeupelqualidade',
+      'agradecopelqualidade',
+      'obrigadopelosabor',
+      'obrigadapelosabor',
+      'valeupelosabor',
+      'agradecopelosabor',
+      'obrigadopelotempero',
+      'obrigadapelotempero',
+      'valeupelotempero',
+      'agradecopelotempero',
+      'obrigadopelocapricho',
+      'obrigadapelocapricho',
+      'valeupelocapricho',
+      'agradecopelocapricho',
+      'obrigadopelocuidado',
+      'obrigadapelocuidado',
+      'valeupelocuidado',
+      'agradecopelocuidado',
+      'obrigadopelozelo',
+      'obrigadapelozelo',
+      'valeupelozelo',
+      'agradecopelozelo',
+      'obrigadopelocomprometimento',
+      'obrigadapelocomprometimento',
+      'valeupelocomprometimento',
+      'agradecopelocomprometimento',
+      'obrigadopelaseriedade',
+      'obrigadapelaseriedade',
+      'valeupelaseriedade',
+      'agradecopelaseriedade',
+      'obrigadopelahonestidade',
+      'obrigadapelahonestidade',
+      'valeupelahonestidade',
+      'agradecopelahonestidade',
+      'obrigadopelatransparencia',
+      'obrigadapelatransparencia',
+      'valeupelatransparencia',
+      'agradecopelatransparencia',
+      'obrigadopelaclareza',
+      'obrigadapelaclareza',
+      'valeupelaclareza',
+      'agradecopelaclareza',
+      'obrigadopelaobjetividade',
+      'obrigadapelaobjetividade',
+      'valeupelaobjetividade',
+      'agradecopelaobjetividade',
+      'obrigadopelaeficiencia',
+      'obrigadapelaeficiencia',
+      'valeupelaeficiencia',
+      'agradecopelaeficiencia',
+      'obrigadopelaagilidade',
+      'obrigadapelaagilidade',
+      'valeupelaagilidade',
+      'agradecopelaagilidade',
+      'obrigadopelapontualidade',
+      'obrigadapelapontualidade',
+      'valeupelapontualidade',
+      'agradecopelapontualidade',
+      'obrigadopelarapidez',
+      'obrigadapelarapidez',
+      'valeupelarapidez',
+      'agradecopelarapidez',
+      'obrigadopelapresteza',
+      'obrigadapelapresteza',
+      'valeupelapresteza',
+      'agradecopelapresteza',
+      'obrigadopelasolicitude',
+      'obrigadapelasolicitude',
+      'valeupelasolicitude',
+      'agradecopelasolicitude',
+      'obrigadopelagentileza',
+      'obrigadapelagentileza',
+      'valeupelagentileza',
+      'agradecopelagentileza',
+      'obrigadopelasimpatia',
+      'obrigadapelasimpatia',
+      'valeupelasimpatia',
+      'agradecopelasimpatia',
+      'obrigadopelaeducacao',
+      'obrigadapelaeducacao',
+      'valeupelaeducacao',
+      'agradecopelaeducacao',
+      'obrigadopelacordialidade',
+      'obrigadapelacordialidade',
+      'valeupelacordialidade',
+      'agradecopelacordialidade',
+      'obrigadopelahospitalidade',
+      'obrigadapelahospitalidade',
+      'valeupelahospitalidade',
+      'agradecopelahospitalidade',
+      'obrigadopelareceptividade',
+      'obrigadapelareceptividade',
+      'valeupelareceptividade',
+      'agradecopelareceptividade',
     };
     // Agradecimento simples só deve ser correspondido se TODAS as palavras da mensagem fizerem parte deste dicionário restrito de "agradecimentos/confirmações vazias".
     // Isso evita que "ok confirmar pedido" ou "ok obg quero pedir" seja tratado como um agradecimento isolado.
@@ -3051,7 +3308,7 @@ class BotService {
 
   bool _ehElogioOuComentarioPositivo(String entrada) {
     final texto = _normalizarIntencao(entrada);
-    
+
     // Padrões de elogio sobre comida/qualidade
     final padroesElogio = [
       r'\b(?:tava|estava|ta|esta|foi|era|sera)\s+(?:uma\s+)?(?:delicia|delicioso|maravilha|maravilhoso|otimo|otima|excelente|perfeito|perfeita|top|show|bom|boa|gostoso|gostosa|saboroso|saborosa|apetitoso|apetitosa)\b',
@@ -3091,25 +3348,66 @@ class BotService {
       r'\b(?:valeu|obrigado|obrigada|agradeço|agradecido|agradecida)\s+(?:mesm[oa]|demais|bastante)\b',
       r'\b(?:adorei|amei|gostei)\s+(?:muito|demais|bastante)\b',
     ];
-    
+
     for (final padrao in padroesElogio) {
       if (RegExp(padrao, caseSensitive: false).hasMatch(texto)) {
         return true;
       }
     }
-    
+
     // Verifica palavras-chave de elogio
     final palavrasElogio = {
-      'delicia', 'delicioso', 'deliciosa', 'maravilha', 'maravilhoso', 'maravilhosa',
-      'otimo', 'otima', 'excelente', 'perfeito', 'perfeita', 'top', 'show',
-      'gostoso', 'gostosa', 'saboroso', 'saborosa', 'apetitoso', 'apetitosa',
-      'rapido', 'rapida', 'veloz', 'indico', 'indicao', 'recomendo', 'recomendacao',
-      'parabens', 'nota10', 'nota100', 'nota1000', '5estrelas', '5stars',
-      'gostei', 'amei', 'adorei', 'adoro', 'amo', 'adorado', 'adorada',
-      'feliz', 'satisfeito', 'satisfeita', 'contente', 'encantado', 'encantada',
-      'surpreendido', 'surpreendida', 'impressionado', 'impressionada',
+      'delicia',
+      'delicioso',
+      'deliciosa',
+      'maravilha',
+      'maravilhoso',
+      'maravilhosa',
+      'otimo',
+      'otima',
+      'excelente',
+      'perfeito',
+      'perfeita',
+      'top',
+      'show',
+      'gostoso',
+      'gostosa',
+      'saboroso',
+      'saborosa',
+      'apetitoso',
+      'apetitosa',
+      'rapido',
+      'rapida',
+      'veloz',
+      'indico',
+      'indicao',
+      'recomendo',
+      'recomendacao',
+      'parabens',
+      'nota10',
+      'nota100',
+      'nota1000',
+      '5estrelas',
+      '5stars',
+      'gostei',
+      'amei',
+      'adorei',
+      'adoro',
+      'amo',
+      'adorado',
+      'adorada',
+      'feliz',
+      'satisfeito',
+      'satisfeita',
+      'contente',
+      'encantado',
+      'encantada',
+      'surpreendido',
+      'surpreendida',
+      'impressionado',
+      'impressionada',
     };
-    
+
     final palavras = texto.split(RegExp(r'\s+'));
     for (final palavra in palavras) {
       final limpa = palavra.replaceAll(RegExp(r'[^a-z]'), '');
@@ -3117,77 +3415,78 @@ class BotService {
         return true;
       }
     }
-    
+
     return false;
   }
 
   bool _ehDesistenciaExplicita(String entrada) {
     final norm = _normalizar(entrada);
     return RegExp(
-      r'^(?:(?:eu\s+|por favor\s+)?(?:deixa\s+qu[ei]eto|deixa\s+pra\s*l[aã]|n[aã]o\s+vou\s+(?:pedir|querer)(?:\s+mais)?|desist[io](?:mos)?|cancela\s+tudo|esquece(?:r)?|nao\s+quero\s+(?:pedir|querer)|nao\s+vou\s+(?:pedir|querer)|desist[io]\s+do\s+pedido|cancela\s+(?:meu\s+)?pedido|para\s+(?:tudo|com\s+isso)|encerra\s+(?:meu\s+)?pedido|quero\s+encerrar|quero\s+parar|nao\s+quero\s+mais\s+nada|nao\s+quero\s+continuar|quero\s+cancelar\s+(?:meu\s+)?pedido|cancela\s+tudo|esquece(?:r)?)(?:\s+(?:obg|obrigado|obrigada|valeu|pfv|por\s+favor))?)$',
-    ).hasMatch(norm) || _correspondeIntencao(entrada, [
-      'deixa quieto',
-      'deixa queto',
-      'deixa pra la',
-      'nao vou pedir',
-      'nao vou querer',
-      'nao vou querer mais',
-      'desisti',
-      'desistimos',
-      'desisto',
-      'cancela tudo',
-      'esquece',
-      'nao quero pedir',
-      'nao quero querer',
-      'desisto do pedido',
-      'cancela meu pedido',
-      'para tudo',
-      'para com isso',
-      'encerra meu pedido',
-      'quero encerrar',
-      'quero parar',
-      'nao quero mais nada',
-      'nao quero continuar',
-      'quero cancelar meu pedido',
-      'cancela tudo',
-      'esquece',
-      'deixa quieto obg',
-      'deixa quieto obrigado',
-      'deixa quieto obrigada',
-      'deixa quieto valeu',
-      'deixa queto obg',
-      'deixa queto obrigado',
-      'deixa queto obrigada',
-      'deixa queto valeu',
-      'deixa pra la obg',
-      'deixa pra la obrigado',
-      'deixa pra la obrigada',
-      'deixa pra la valeu',
-      'nao vou pedir obg',
-      'nao vou pedir obrigado',
-      'nao vou pedir obrigada',
-      'nao vou pedir valeu',
-      'nao vou querer obg',
-      'nao vou querer obrigado',
-      'nao vou querer obrigada',
-      'nao vou querer valeu',
-      'desisti obg',
-      'desisti obrigado',
-      'desisti obrigada',
-      'desisti valeu',
-      'desisto obg',
-      'desisto obrigado',
-      'desisto obrigada',
-      'desisto valeu',
-      'cancela tudo obg',
-      'cancela tudo obrigado',
-      'cancela tudo obrigada',
-      'cancela tudo valeu',
-      'esquece obg',
-      'esquece obrigado',
-      'esquece obrigada',
-      'esquece valeu',
-    ]);
+          r'^(?:(?:eu\s+|por favor\s+)?(?:deixa\s+qu[ei]eto|deixa\s+pra\s*l[aã]|n[aã]o\s+vou\s+(?:pedir|querer)(?:\s+mais)?|desist[io](?:mos)?|cancela\s+tudo|esquece(?:r)?|nao\s+quero\s+(?:pedir|querer)|nao\s+vou\s+(?:pedir|querer)|desist[io]\s+do\s+pedido|cancela\s+(?:meu\s+)?pedido|para\s+(?:tudo|com\s+isso)|encerra\s+(?:meu\s+)?pedido|quero\s+encerrar|quero\s+parar|nao\s+quero\s+mais\s+nada|nao\s+quero\s+continuar|quero\s+cancelar\s+(?:meu\s+)?pedido|cancela\s+tudo|esquece(?:r)?)(?:\s+(?:obg|obrigado|obrigada|valeu|pfv|por\s+favor))?)$',
+        ).hasMatch(norm) ||
+        _correspondeIntencao(entrada, [
+          'deixa quieto',
+          'deixa queto',
+          'deixa pra la',
+          'nao vou pedir',
+          'nao vou querer',
+          'nao vou querer mais',
+          'desisti',
+          'desistimos',
+          'desisto',
+          'cancela tudo',
+          'esquece',
+          'nao quero pedir',
+          'nao quero querer',
+          'desisto do pedido',
+          'cancela meu pedido',
+          'para tudo',
+          'para com isso',
+          'encerra meu pedido',
+          'quero encerrar',
+          'quero parar',
+          'nao quero mais nada',
+          'nao quero continuar',
+          'quero cancelar meu pedido',
+          'cancela tudo',
+          'esquece',
+          'deixa quieto obg',
+          'deixa quieto obrigado',
+          'deixa quieto obrigada',
+          'deixa quieto valeu',
+          'deixa queto obg',
+          'deixa queto obrigado',
+          'deixa queto obrigada',
+          'deixa queto valeu',
+          'deixa pra la obg',
+          'deixa pra la obrigado',
+          'deixa pra la obrigada',
+          'deixa pra la valeu',
+          'nao vou pedir obg',
+          'nao vou pedir obrigado',
+          'nao vou pedir obrigada',
+          'nao vou pedir valeu',
+          'nao vou querer obg',
+          'nao vou querer obrigado',
+          'nao vou querer obrigada',
+          'nao vou querer valeu',
+          'desisti obg',
+          'desisti obrigado',
+          'desisti obrigada',
+          'desisti valeu',
+          'desisto obg',
+          'desisto obrigado',
+          'desisto obrigada',
+          'desisto valeu',
+          'cancela tudo obg',
+          'cancela tudo obrigado',
+          'cancela tudo obrigada',
+          'cancela tudo valeu',
+          'esquece obg',
+          'esquece obrigado',
+          'esquece obrigada',
+          'esquece valeu',
+        ]);
   }
 
   bool _ehNegacaoPedido(String entrada) => _corresponde(entrada, [
@@ -3217,14 +3516,49 @@ class BotService {
       }
     }
     final palavrasReclamacao = {
-      'ruim', 'pessimo', 'pessima', 'horrivel', 'nojento', 'nojenta',
-      'estragado', 'estragada', 'vencido', 'vencida', 'gelado', 'gelada',
-      'frio', 'fria', 'morno', 'morna', 'sem_sabor', 'gosto_ruim',
-      'nao_recomendo', 'nao_voltarei', 'unca_mais', 'jamais_mais',
-      'pena', 'decepcionado', 'decepcionada', 'decepcao', 'frustrado',
-      'frustrada', 'irritado', 'irritada', 'chateado', 'chateada',
-      'insatisfeito', 'insatisfeita', 'atrasado', 'atrasada', 'demorado',
-      'demorada', 'lento', 'lenta', 'caro', 'carissimo', 'abusivo',
+      'ruim',
+      'pessimo',
+      'pessima',
+      'horrivel',
+      'nojento',
+      'nojenta',
+      'estragado',
+      'estragada',
+      'vencido',
+      'vencida',
+      'gelado',
+      'gelada',
+      'frio',
+      'fria',
+      'morno',
+      'morna',
+      'sem_sabor',
+      'gosto_ruim',
+      'nao_recomendo',
+      'nao_voltarei',
+      'unca_mais',
+      'jamais_mais',
+      'pena',
+      'decepcionado',
+      'decepcionada',
+      'decepcao',
+      'frustrado',
+      'frustrada',
+      'irritado',
+      'irritada',
+      'chateado',
+      'chateada',
+      'insatisfeito',
+      'insatisfeita',
+      'atrasado',
+      'atrasada',
+      'demorado',
+      'demorada',
+      'lento',
+      'lenta',
+      'caro',
+      'carissimo',
+      'abusivo',
     };
     final palavras = texto.split(RegExp(r'\s+'));
     for (final palavra in palavras) {
@@ -3234,6 +3568,14 @@ class BotService {
       }
     }
     return false;
+  }
+
+  bool _ehReclamacaoGrave(String entrada) {
+    final texto = _normalizarIntencao(entrada);
+    return RegExp(
+      r'\b(?:alergia|alergico|alergica|intoxicacao|passei mal|passei muito mal|vomitei|vomito|diarreia|hospital|hospitalar|medico|ameaça|ameaca|policia|procon|processo|denuncia|fraude|golpe|racismo|agressao|perigo|contaminad[oa])\b',
+      caseSensitive: false,
+    ).hasMatch(texto);
   }
 
   bool _ehIndecisao(String entrada) {
@@ -3252,13 +3594,44 @@ class BotService {
       }
     }
     final palavrasIndecisao = {
-      'nao_sei', 'sei_la', 'duvida', 'duvidoso', 'duvidosa', 'nao_decidi',
-      'ajuda', 'ajudar', 'sugestao', 'sugestoes', 'sugere', 'sugerir',
-      'recomenda', 'recomendar', 'recomendacao', 'recomendacoes', 'dica', 'dicas',
-      'opcao', 'opcoes', 'escolha', 'escolher', 'melhor', 'mais_pedido',
-      'mais_vendido', 'mais_popular', 'mais_gostoso', 'mais_bom', 'mais_barato',
-      'mais_em_conta', 'mais_rapido', 'mais_pratico', 'mais_saudavel', 'mais_leve',
-      'mais_forte', 'mais_fraco', 'mais_encorpado', 'mais_saboroso',
+      'nao_sei',
+      'sei_la',
+      'duvida',
+      'duvidoso',
+      'duvidosa',
+      'nao_decidi',
+      'ajuda',
+      'ajudar',
+      'sugestao',
+      'sugestoes',
+      'sugere',
+      'sugerir',
+      'recomenda',
+      'recomendar',
+      'recomendacao',
+      'recomendacoes',
+      'dica',
+      'dicas',
+      'opcao',
+      'opcoes',
+      'escolha',
+      'escolher',
+      'melhor',
+      'mais_pedido',
+      'mais_vendido',
+      'mais_popular',
+      'mais_gostoso',
+      'mais_bom',
+      'mais_barato',
+      'mais_em_conta',
+      'mais_rapido',
+      'mais_pratico',
+      'mais_saudavel',
+      'mais_leve',
+      'mais_forte',
+      'mais_fraco',
+      'mais_encorpado',
+      'mais_saboroso',
     };
     final palavras = texto.split(RegExp(r'\s+'));
     for (final palavra in palavras) {
@@ -3452,7 +3825,8 @@ class BotService {
       'atendente',
       _textoFluxo('inicio', 'botaoHumano', 'Falar atendente')
     ])) {
-      banco.definirModoHumano(msg.telefone, true);
+      banco.definirModoHumano(msg.telefone, true,
+          origem: 'cliente', motivo: 'solicitacao_explicita');
       await whatsapp.enviarTexto(
         msg.telefone,
         _textoFluxo('sistema', 'humanoAtivado',
@@ -7646,47 +8020,13 @@ class BotService {
       return itens.length == 1 ? 'na sua marmita' : 'na próxima marmita';
     }
 
-    final tamanhoNormalizado = _normalizar(tamanho);
     final totalRepresentado = itens.fold<int>(0, (soma, atual) {
       final qtd = atual['quantidade'];
       return soma + (qtd is num && qtd >= 1 ? qtd.toInt() : 1);
     });
     final temMultiplas = totalRepresentado > 1 || (totalSolicitado ?? 0) > 1;
     if (!temMultiplas) return 'na sua marmita';
-
-    var numeroInicial = 1;
-    for (var i = 0; i < indice; i++) {
-      if (_normalizar(itens[i]['tamanho']?.toString() ?? '') ==
-          tamanhoNormalizado) {
-        final quantidadeAnterior = itens[i]['quantidade'];
-        numeroInicial += quantidadeAnterior is num && quantidadeAnterior >= 1
-            ? quantidadeAnterior.toInt()
-            : 1;
-      }
-    }
-    final quantidade = item['quantidade'];
-    final unidades = quantidade is num && quantidade >= 1
-        ? quantidade.toInt()
-        : itens.length == 1 && (totalSolicitado ?? 0) > 1
-            ? totalSolicitado!.toInt()
-            : 1;
-    final plural = switch (tamanhoNormalizado) {
-      'pequena' => 'pequenas',
-      'media' => 'médias',
-      'grande' => 'grandes',
-      _ => tamanho.endsWith('a')
-          ? '${tamanho.substring(0, tamanho.length - 1)}as'
-          : '${tamanho}s',
-    };
-    if (unidades == 1) {
-      return 'na marmita ${tamanho.toLowerCase()} $numeroInicial';
-    }
-
-    final numeros = List.generate(unidades, (i) => '${numeroInicial + i}');
-    final listaNumeros = numeros.length == 2
-        ? '${numeros.first} e ${numeros.last}'
-        : '${numeros.take(numeros.length - 1).join(', ')} e ${numeros.last}';
-    return 'nas marmitas $plural $listaNumeros';
+    return 'nessa combinação';
   }
 
   bool _ehComandoCorrigir(String entrada) => _correspondeIntencao(entrada, [

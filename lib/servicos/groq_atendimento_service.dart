@@ -9,9 +9,10 @@ class InterpretacaoAtendimento {
   final String tipo;
   final String texto;
   final Map<String, dynamic> pedido;
+  final String? motivoHumano;
 
   const InterpretacaoAtendimento(this.tipo, this.texto,
-      {this.pedido = const {}});
+      {this.pedido = const {}, this.motivoHumano});
 }
 
 /// Interpreta mensagens sem executar operações do pedido.
@@ -58,7 +59,7 @@ class GroqAtendimentoService {
                   'properties': {
                     'tipo': {
                       'type': 'string',
-                      'enum': ['pedido', 'duvida', 'escolha'],
+                      'enum': ['pedido', 'duvida', 'escolha', 'humano'],
                     },
                     'texto': {'type': 'string'},
                     'itens': {
@@ -109,8 +110,25 @@ class GroqAtendimentoService {
                       },
                     },
                     'finalizarItens': {'type': 'boolean'},
+                    'motivoHumano': {
+                      'type': ['string', 'null'],
+                      'enum': [
+                        'fora_cardapio',
+                        'duvida_nao_respondida',
+                        'reclamacao_grave',
+                        'solicitacao_explicita',
+                        'midia_nao_processada',
+                        null,
+                      ],
+                    },
                   },
-                  'required': ['tipo', 'texto', 'itens', 'finalizarItens'],
+                  'required': [
+                    'tipo',
+                    'texto',
+                    'itens',
+                    'finalizarItens',
+                    'motivoHumano',
+                  ],
                   'additionalProperties': false,
                 },
               },
@@ -123,6 +141,7 @@ class GroqAtendimentoService {
 
 PRIORIDADE E ESTADO
 1. Siga sempre o estado atual e os dados estruturados fornecidos em etapa, etapaAtual, opcoesDaEtapa e rascunhoPedidoAtual. Esses dados representam o fluxo válido. Não apague nem contradiga informação já registrada.
+   Use historicoRecente apenas para entender referências e retomadas. O estado estruturado atual tem prioridade; não repita perguntas já respondidas e não trate uma mudança de assunto como cancelamento do pedido.
 2. Use somente contextoLoja e opcoesCardapio. Nunca invente pratos, disponibilidade, tamanhos, preços, taxas, cidades, horários, endereço, forma de pagamento, chave Pix ou ações concluídas.
 3. O fluxo de arroz e o de feijão só existem se seus indicadores estiverem ativos. Quando desativados, não ofereça, pergunte, extraia nem inclua arroz ou feijão.
 4. O backend valida e executa operações. Você apenas classifica a mensagem, extrai dados explícitos e redige respostas; nunca diga que o pedido foi enviado, confirmado ou que um atendente foi chamado, a menos que o estado/contexto confirme isso.
@@ -171,6 +190,10 @@ INTENÇÃO: MONTAR O PEDIDO
 - Use tipo pedido quando a pessoa quiser pedir, informar ou corrigir qualquer detalhe de uma marmita, adicionar outra ou finalizar as marmitas.
 - Extraia somente dados que a pessoa informou claramente na mensagem atual. Atualize o índice correspondente em rascunhoPedidoAtual; não duplique itens já registrados. Se não houver índice indicado e há um item incompleto, atualize-o; se todos estiverem completos e a pessoa iniciou outra marmita, use o próximo índice.
 - Para cada combinação, capture tamanho, quantidade, misturas, acompanhamentos e, apenas quando ativos, arroz e feijão. O tamanho escolhido informa quantidadeMisturas e quantidadeAcompanhamentos permitidos/exigidos. Use os arrays misturas e acompanhamentos para preservar todas as escolhas, sem duplicatas e sem exceder as quantidades configuradas. Os campos singulares mistura/acompanhamento são compatibilidade e devem receber a primeira escolha quando houver escolha; os arrays devem conter todas. Se o cliente informou só uma de várias opções exigidas, preserve-a e não invente as demais. Se a quantidade da marmita não foi dita, não a invente, salvo “uma marmita”/“uma pequena”, que indica quantidade 1. Não deduza quantidade por soma, salvo se a pessoa declarar um total e todas as parcelas restantes ficarem inequívocas; nesse caso, confira a aritmética e use os índices corretos.
+- Se a primeira mensagem já for um pedido completo, extraia todos os dados nela: quantidade de marmitas, tamanho, mistura(s) e acompanhamento(s), mesmo que estejam escritos em linguagem natural, separados por vírgulas ou em frases longas. Não pergunte novamente quantas marmitas são nem repita campos já informados. Valide cada escolha contra opcoesCardapio; se faltar apenas algum detalhe obrigatório, pergunte somente esse detalhe.
+- Se uma opção solicitada não existir em opcoesCardapio, não invente uma alternativa como se fosse a mesma. Use tipo humano, motivoHumano fora_cardapio e uma mensagem curta informando que um atendente vai verificar.
+- Se a dúvida não puder ser respondida com contextoLoja, opcoesCardapio ou estado atual, use tipo humano, motivoHumano duvida_nao_respondida e não tente adivinhar.
+- Quando uma mensagem trouxer várias marmitas completas, crie um item para cada combinação e mantenha as escolhas associadas à marmita correta. Quando trouxer uma quantidade seguida de uma única combinação, use essa quantidade no item, sem criar linhas duplicadas.
 - Associe cada detalhe à marmita certa. Exemplo: “duas pequenas: a primeira carne e macarrão, a segunda frango e batata” cria duas combinações distintas, ambas de tamanho Pequena e quantidade 1. Exemplo: “duas pequenas de carne com batata” cria uma combinação com quantidade 2. Não misture acompanhamentos ou misturas entre combinações.
 - Reconheça variações e erros de digitação somente quando houver uma única opção ativa claramente correspondente. Exemplos: “calabres” ou “pode ser calabre” podem indicar “Calabresa acebolada”; “carne moída também” indica “Carne moída”; “pode se batata” indica “Batata”. Grave sempre o nome canônico do cardápio. Se houver mais de uma opção possível, pergunte qual a pessoa quis dizer.
 - Distinga pergunta de escolha. “Vocês não têm calabresa?” ou “calabresa tem?” é uma pergunta de disponibilidade, não escolha de mistura. Responda usando o cardápio. “Calabresa” ou “pode ser calabresa” durante a pergunta sobre mistura é uma escolha.
@@ -178,15 +201,15 @@ INTENÇÃO: MONTAR O PEDIDO
 - Não transforme dúvida, saudação, “vou querer” sem detalhes ou resposta ambígua em pedido completo. Não repita “item adicionado” se não houve item novo.
 
 COMO CONVERSAR
-- Seja acolhedora e objetiva. Faça uma pergunta por vez, somente sobre o próximo dado que falta. Não despeje uma lista de perguntas ou instruções.
-- Não mostre listas de opções, botões, números, exemplos de como escrever, nomes internos, etapas, JSON, explicações sobre o funcionamento da IA ou mensagens técnicas. As opções internas servem apenas para reconhecer a resposta.
+- Seja acolhedora e objetiva. No início de um pedido, descubra primeiro quantas marmitas serão. Quando for apenas uma, peça tamanho, mistura(s) e acompanhamento na mesma pergunta e aceite que o cliente responda tudo de uma vez. Não faça uma sequência de perguntas separadas para esses três dados. Se a quantidade for maior que uma, associe os detalhes a cada marmita e aceite respostas completas para várias delas na mesma mensagem.
+- Não mostre listas de opções, botões, índices, numeração de marmitas, expressões como “marmita 1” ou “1 de 2”, exemplos de como escrever, nomes internos, etapas, JSON, explicações sobre o funcionamento da IA ou mensagens técnicas. As opções internas servem apenas para reconhecer a resposta.
 - Aproveite tudo que a pessoa já disse e não pergunte de novo um campo preenchido. Ao completar uma resposta, avance para o próximo campo realmente ausente. Se a pessoa fizer uma pergunta durante o pedido, responda primeiro e preserve o rascunho.
 - Nunca ecoe a mensagem do cliente como resposta. Se não entendeu, peça esclarecimento em linguagem simples. Não acrescente perguntas ou convites genéricos ao fim de respostas que já resolveram a dúvida.
 - Endereço, observação e outros dados pessoais são tratados pelo backend em suas etapas próprias. Não solicite nem repita esses dados na resposta da IA.
 
 FORMATO OBRIGATÓRIO
 Devolva somente um objeto JSON válido, sem markdown, comentários ou texto antes/depois, com este formato exato:
-{"tipo":"pedido|duvida|escolha","texto":"","itens":[{"indice":1,"tamanho":null,"quantidade":null,"mistura":null,"misturas":[],"acompanhamento":null,"acompanhamentos":[],"arroz":null,"feijao":null}],"finalizarItens":false}
+{"tipo":"pedido|duvida|escolha|humano","texto":"","itens":[{"indice":1,"tamanho":null,"quantidade":null,"mistura":null,"misturas":[],"acompanhamento":null,"acompanhamentos":[],"arroz":null,"feijao":null}],"finalizarItens":false,"motivoHumano":null}
 
 - tipo pedido: texto vazio; itens contém apenas os campos explicitamente capturados ou corrigidos. Se ainda não há detalhe de marmita, use itens vazio e deixar o backend conduzir a pergunta seguinte.
 - tipo duvida: itens vazio; texto contém somente a resposta ao cliente. Para pedido geral do cardápio, texto deve ser exatamente CARDAPIO_CONFIGURADO.
@@ -230,13 +253,23 @@ Devolva somente um objeto JSON válido, sem markdown, comentários ou texto ante
       if (itens is List) 'itens': itens,
       'finalizarItens': parsed['finalizarItens'] == true,
     };
-    if (!{'escolha', 'duvida', 'pedido'}.contains(tipo) ||
+    final motivoHumano = parsed['motivoHumano']?.toString();
+    if (!{'escolha', 'duvida', 'pedido', 'humano'}.contains(tipo) ||
         (tipo != 'pedido' && texto.isEmpty) ||
+        (tipo == 'humano' &&
+            !{
+              'fora_cardapio',
+              'duvida_nao_respondida',
+              'reclamacao_grave',
+              'solicitacao_explicita',
+              'midia_nao_processada',
+            }.contains(motivoHumano)) ||
         texto.length > 300 ||
         (itens is List && itens.length > 20)) {
       throw const FormatException('Interpretação inválida da Groq.');
     }
-    return InterpretacaoAtendimento(tipo!, texto, pedido: pedido);
+    return InterpretacaoAtendimento(tipo!, texto,
+        pedido: pedido, motivoHumano: motivoHumano);
   }
 
   void fechar() => _client.close();

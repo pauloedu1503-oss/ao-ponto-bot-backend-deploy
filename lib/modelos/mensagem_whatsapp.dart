@@ -3,6 +3,10 @@ class MensagemWhatsApp {
   final String telefone;
   final String nome;
   final String texto;
+  final String? tipo;
+  final String? mediaId;
+  final double? latitude;
+  final double? longitude;
   final String? respostaId;
   final DateTime? enviadaEm;
 
@@ -11,6 +15,10 @@ class MensagemWhatsApp {
     required this.telefone,
     required this.nome,
     required this.texto,
+    this.tipo,
+    this.mediaId,
+    this.latitude,
+    this.longitude,
     this.respostaId,
     this.enviadaEm,
   });
@@ -18,4 +26,12 @@ class MensagemWhatsApp {
   String get entrada => (respostaId?.trim().isNotEmpty ?? false)
       ? respostaId!.trim()
       : texto.trim();
+
+  bool get ehMidia =>
+      tipo != null &&
+      tipo != 'text' &&
+      tipo != 'interactive' &&
+      tipo != 'button';
+
+  bool get temLocalizacao => latitude != null && longitude != null;
 }

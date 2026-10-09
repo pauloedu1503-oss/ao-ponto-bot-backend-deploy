@@ -191,6 +191,11 @@ class Banco {
         ultima_atividade TEXT NOT NULL
       );
     ''');
+    _adicionarColunaSeAusente(
+        'sessoes', 'transferencia_origem', "TEXT NOT NULL DEFAULT 'manual'");
+    _adicionarColunaSeAusente(
+        'sessoes', 'transferencia_motivo', "TEXT NOT NULL DEFAULT ''");
+    _adicionarColunaSeAusente('sessoes', 'transferencia_em', 'TEXT');
 
     db.execute('''
       CREATE TABLE IF NOT EXISTS mensagens_processadas (
@@ -923,7 +928,10 @@ class Banco {
   }
 
   void definirModoHumano(String telefone, bool ativo,
-      {bool criarAlerta = true, bool preservarDados = false}) {
+      {bool criarAlerta = true,
+      bool preservarDados = false,
+      String origem = 'manual',
+      String motivo = ''}) {
     final sessao = obterSessao(telefone);
     if (ativo && criarAlerta && !preservarDados) {
       salvarSessao(
@@ -962,6 +970,15 @@ class Banco {
       ]);
     } else {
       db.execute('UPDATE push_humano SET ativo=0 WHERE telefone=?', [telefone]);
+    }
+    if (ativo) {
+      db.execute(
+          'UPDATE sessoes SET transferencia_origem=?, transferencia_motivo=?, transferencia_em=? WHERE telefone=?',
+          [origem, motivo, agoraIso(), telefone]);
+    } else {
+      db.execute(
+          "UPDATE sessoes SET transferencia_origem='manual', transferencia_motivo='', transferencia_em=NULL WHERE telefone=?",
+          [telefone]);
     }
     log('INFO', ativo ? 'modo_humano_ativado' : 'modo_humano_desativado',
         telefone);
@@ -1035,6 +1052,7 @@ class Banco {
   List<Map<String, dynamic>> listarSessoesHumanas() {
     final rows = db.select('''
       SELECT s.telefone, s.nome, s.ultima_atividade,
+        s.transferencia_origem, s.transferencia_motivo, s.transferencia_em,
         COALESCE(p.ativo, 0) AS alerta_ativo
       FROM sessoes s
       LEFT JOIN push_humano p ON p.telefone = s.telefone
@@ -1046,6 +1064,9 @@ class Banco {
               'telefone': r['telefone'],
               'nome': r['nome'] ?? '',
               'ultimaAtividade': r['ultima_atividade'],
+              'transferenciaOrigem': r['transferencia_origem'] ?? 'manual',
+              'transferenciaMotivo': r['transferencia_motivo'] ?? '',
+              'transferenciaEm': r['transferencia_em'],
               'alertaAtivo': (r['alerta_ativo'] as int) == 1,
             })
         .toList();
@@ -1317,6 +1338,17 @@ class Banco {
         .select('SELECT COALESCE(MAX(id),0) AS id FROM pedidos')
         .first['id'] as int;
     final config = obterConfiguracao();
+    final iaEventos = db.select('''
+      SELECT evento, COUNT(*) AS quantidade
+      FROM logs
+      WHERE julianday(criado_em) >= julianday('now', '-1 day')
+        AND evento IN ('ia_interpretacao', 'ia_indisponivel_fallback_bot')
+      GROUP BY evento
+    ''');
+    final iaResumo = <String, int>{
+      for (final row in iaEventos)
+        row['evento'].toString(): (row['quantidade'] as num).toInt(),
+    };
     return {
       'pedidosHoje': rows['pedidos'] ?? 0,
       'vendasHoje': (rows['vendas'] as num?)?.toDouble() ?? 0.0,
@@ -1339,6 +1371,12 @@ class Banco {
           )
           .first['n'],
       'estadoManual': (config['dados'] as Map<String, dynamic>)['estadoBot'],
+      'iaInterpretacoes24h': iaResumo['ia_interpretacao'] ?? 0,
+      'iaFallbacks24h': iaResumo['ia_indisponivel_fallback_bot'] ?? 0,
+      'iaTransferencias24h': db.select('''
+            SELECT COUNT(*) AS quantidade FROM sessoes
+            WHERE modo_humano = 1 AND julianday(transferencia_em) >= julianday('now', '-1 day')
+          ''').first['quantidade'],
     };
   }
 

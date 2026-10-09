@@ -24,10 +24,12 @@ class Api {
 
   Timer? _timer;
   bool _processando = false;
+  bool _usarJanelaAgrupamento = false;
   DateTime _ultimaManutencaoMemoria = DateTime.now();
   Api(this.banco, this.auth, this.bot, this.push);
 
   void iniciarWorker() {
+    _usarJanelaAgrupamento = true;
     _timer ??=
         Timer.periodic(const Duration(seconds: 2), (_) => processarPendentes());
     unawaited(processarPendentes());
@@ -45,17 +47,52 @@ class Api {
     _processando = true;
     try {
       final rows = banco.db.select(
-          'SELECT payload FROM webhook_entrada ORDER BY rowid LIMIT 100');
+          'SELECT payload, criado_em FROM webhook_entrada ORDER BY rowid LIMIT 100');
+      final grupos = <Map<String, dynamic>>[];
       for (final row in rows) {
         final m = jsonDecode(row['payload'] as String) as Map<String, dynamic>;
+        final podeAgrupar = m['tipo'] == 'text' &&
+            (m['respostaId'] == null || m['respostaId'].toString().isEmpty);
+        if (_usarJanelaAgrupamento &&
+            podeAgrupar &&
+            DateTime.tryParse(row['criado_em']?.toString() ?? '') != null &&
+            DateTime.now().toUtc().difference(
+                      DateTime.parse(row['criado_em'].toString()).toUtc(),
+                    ) <
+                const Duration(seconds: 30)) {
+          continue;
+        }
+        final ultimo = grupos.isEmpty ? null : grupos.last;
+        if (podeAgrupar &&
+            ultimo != null &&
+            ultimo['telefone'] == m['telefone'] &&
+            ultimo['tipo'] == 'text') {
+          ultimo['texto'] = '${ultimo['texto']}\n${m['texto']}'.trim();
+          (ultimo['_ids'] as List).add(m['id']);
+        } else {
+          grupos.add({
+            ...m,
+            '_ids': [m['id']]
+          });
+        }
+      }
+      for (final m in grupos) {
         try {
           await bot.processar(MensagemWhatsApp(
               id: m['id'],
               telefone: m['telefone'],
               nome: m['nome'],
               texto: m['texto'],
+              tipo: m['tipo'],
+              mediaId: m['mediaId'],
+              latitude: (m['latitude'] as num?)?.toDouble(),
+              longitude: (m['longitude'] as num?)?.toDouble(),
               respostaId: m['respostaId'],
               enviadaEm: DateTime.tryParse(m['enviadaEm'] ?? '')));
+          final ids = (m['_ids'] as List).skip(1).toList();
+          for (final id in ids) {
+            banco.db.execute('DELETE FROM webhook_entrada WHERE id = ?', [id]);
+          }
         } catch (e) {
           banco.log('ERROR', 'webhook_processamento', e.runtimeType.toString());
           break;
@@ -757,6 +794,10 @@ class Api {
                 'telefone': m.telefone,
                 'nome': m.nome,
                 'texto': m.texto,
+                'tipo': m.tipo,
+                'mediaId': m.mediaId,
+                'latitude': m.latitude,
+                'longitude': m.longitude,
                 'respostaId': m.respostaId,
                 'enviadaEm': m.enviadaEm?.toIso8601String()
               }),
@@ -823,6 +864,9 @@ class Api {
           String texto = '';
           String? respostaId;
           final type = mRaw['type']?.toString();
+          String? mediaId;
+          double? latitude;
+          double? longitude;
           if (type == 'text' && mRaw['text'] is Map) {
             texto = (mRaw['text'] as Map)['body']?.toString() ?? '';
           } else if (type == 'interactive' && mRaw['interactive'] is Map) {
@@ -839,6 +883,15 @@ class Api {
             final button = mRaw['button'] as Map;
             respostaId = button['payload']?.toString();
             texto = button['text']?.toString() ?? '';
+          } else if (type == 'location' && mRaw['location'] is Map) {
+            final location = mRaw['location'] as Map;
+            latitude = (location['latitude'] as num?)?.toDouble();
+            longitude = (location['longitude'] as num?)?.toDouble();
+            texto = location['name']?.toString() ?? '';
+          } else if (mRaw[type] is Map) {
+            final media = mRaw[type] as Map;
+            mediaId = media['id']?.toString();
+            texto = media['caption']?.toString() ?? '';
           } else {
             texto = '';
           }
@@ -848,6 +901,10 @@ class Api {
             telefone: from,
             nome: (nomeContato?.isNotEmpty ?? false) ? nomeContato! : 'Cliente',
             texto: texto,
+            tipo: type,
+            mediaId: mediaId,
+            latitude: latitude,
+            longitude: longitude,
             respostaId: respostaId,
             enviadaEm: int.tryParse(mRaw['timestamp']?.toString() ?? '') == null
                 ? null
