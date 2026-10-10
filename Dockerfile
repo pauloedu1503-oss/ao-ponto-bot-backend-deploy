@@ -15,7 +15,7 @@ FROM node:22-bookworm-slim AS whatsapp
 WORKDIR /app/whatsapp_bridge
 COPY whatsapp_bridge/package.json whatsapp_bridge/package-lock.json ./
 RUN npm ci --omit=dev
-COPY whatsapp_bridge/index.js ./index.js
+COPY whatsapp_bridge/index.js whatsapp_bridge/bridge_utils.js whatsapp_bridge/saida_queue.js whatsapp_bridge/ack_tracker.js ./
 
 FROM node:22-bookworm-slim
 RUN apt-get update \
