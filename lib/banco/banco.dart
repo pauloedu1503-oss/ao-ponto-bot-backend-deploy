@@ -1322,6 +1322,15 @@ class Banco {
         [sucesso ? 'done' : 'failed', agoraIso(), id]);
   }
 
+  void registrarMensagemAgrupadaComoProcessada(String id) {
+    db.execute('''
+      INSERT INTO mensagens_processadas (id, status, atualizado_em)
+      VALUES (?, 'done', ?)
+      ON CONFLICT(id) DO UPDATE SET
+        status='done', atualizado_em=excluded.atualizado_em
+    ''', [id, agoraIso()]);
+  }
+
   Map<String, dynamic> dashboard() {
     final chave = hojeChave();
     final rows = db.select('''
@@ -1431,20 +1440,27 @@ class Banco {
       }
     }
     final sugestoes = <String, String>{
-      'ia_fallback': 'Revisar disponibilidade da IA e criar teste para a entrada que caiu no fluxo determinístico.',
-      'transferencia': 'Revisar o motivo da transferência e adicionar variações ao fluxo de atendimento humano.',
-      'ambiguidade': 'Revisar sinônimos e exigir confirmação quando houver mais de uma opção possível.',
-      'correcao_cliente': 'Adicionar a frase corrigida aos testes e revisar a associação com a etapa atual.',
-      'etapa_sem_avanco': 'Verificar se a pergunta foi repetida ou se faltou tratar uma resposta válida.',
-      'pedido_incompleto': 'Adicionar um teste de pedido completo dividido em mensagens e validar os campos obrigatórios.',
+      'ia_fallback':
+          'Revisar disponibilidade da IA e criar teste para a entrada que caiu no fluxo determinístico.',
+      'transferencia':
+          'Revisar o motivo da transferência e adicionar variações ao fluxo de atendimento humano.',
+      'ambiguidade':
+          'Revisar sinônimos e exigir confirmação quando houver mais de uma opção possível.',
+      'correcao_cliente':
+          'Adicionar a frase corrigida aos testes e revisar a associação com a etapa atual.',
+      'etapa_sem_avanco':
+          'Verificar se a pergunta foi repetida ou se faltou tratar uma resposta válida.',
+      'pedido_incompleto':
+          'Adicionar um teste de pedido completo dividido em mensagens e validar os campos obrigatórios.',
     };
     return {
       'periodoDias': limiteDias,
       'totalDiagnosticos': rows.length,
       'porCategoria': porCategoria,
       'porEtapa': porEtapa,
-      'sugestoes': porCategoria.map((categoria, _) =>
-          MapEntry(categoria, sugestoes[categoria] ??
+      'sugestoes': porCategoria.map((categoria, _) => MapEntry(
+          categoria,
+          sugestoes[categoria] ??
               'Revisar os exemplos desse caso e criar um teste de regressão.')),
       'exemplos': exemplos,
     };
@@ -1517,32 +1533,38 @@ class Banco {
     final catalogo = <String, Map<String, String>>{
       'ia_indisponivel_fallback_bot': {
         'titulo': 'Revisar disponibilidade da IA',
-        'acao': 'Verificar erros de rede, limite ou configuração da Groq e ampliar o fallback determinístico.',
+        'acao':
+            'Verificar erros de rede, limite ou configuração da Groq e ampliar o fallback determinístico.',
         'prioridade': 'alta',
       },
       'bot_erro': {
         'titulo': 'Investigar falhas no fluxo do bot',
-        'acao': 'Reproduzir as mensagens próximas do horário indicado e criar um teste de regressão.',
+        'acao':
+            'Reproduzir as mensagens próximas do horário indicado e criar um teste de regressão.',
         'prioridade': 'alta',
       },
       'bot_transacao_desfeita': {
         'titulo': 'Revisar consistência da sessão',
-        'acao': 'Verificar a transição que desfez a transação e garantir que o rascunho continue íntegro.',
+        'acao':
+            'Verificar a transição que desfez a transação e garantir que o rascunho continue íntegro.',
         'prioridade': 'alta',
       },
       'api_erro': {
         'titulo': 'Revisar erros da API',
-        'acao': 'Agrupar a rota afetada e adicionar teste para o payload que provocou a falha.',
+        'acao':
+            'Agrupar a rota afetada e adicionar teste para o payload que provocou a falha.',
         'prioridade': 'media',
       },
       'worker_erro': {
         'titulo': 'Revisar processamento da fila',
-        'acao': 'Verificar mensagens pendentes, duplicadas ou presas e criar teste do ciclo de reprocessamento.',
+        'acao':
+            'Verificar mensagens pendentes, duplicadas ou presas e criar teste do ciclo de reprocessamento.',
         'prioridade': 'alta',
       },
       'midia_nao_processada': {
         'titulo': 'Melhorar interpretação de mídia',
-        'acao': 'Revisar áudio, imagem e legenda do evento e adicionar um caso de teste para a mídia recebida.',
+        'acao':
+            'Revisar áudio, imagem e legenda do evento e adicionar um caso de teste para a mídia recebida.',
         'prioridade': 'media',
       },
     };

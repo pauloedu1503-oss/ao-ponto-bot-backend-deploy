@@ -33,7 +33,8 @@ class MensagemWhatsApp {
       tipo != null &&
       tipo != 'text' &&
       tipo != 'interactive' &&
-      tipo != 'button';
+      tipo != 'button' &&
+      !temLocalizacao;
 
   bool get temLocalizacao => latitude != null && longitude != null;
 }

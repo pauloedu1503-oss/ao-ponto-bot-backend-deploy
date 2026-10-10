@@ -48,7 +48,8 @@ class GroqAtendimentoService {
       )
       ..fields['language'] = 'pt'
       ..fields['response_format'] = 'json'
-      ..files.add(http.MultipartFile.fromBytes('file', bytes, filename: filename));
+      ..files
+          .add(http.MultipartFile.fromBytes('file', bytes, filename: filename));
     final response = await request.send().timeout(const Duration(seconds: 20));
     if (response.statusCode < 200 || response.statusCode >= 300) return null;
     final body = await response.stream.bytesToString();
@@ -200,6 +201,7 @@ class GroqAtendimentoService {
                       'enum': [
                         'fora_cardapio',
                         'duvida_nao_respondida',
+                        'reclamacao',
                         'reclamacao_grave',
                         'solicitacao_explicita',
                         'midia_nao_processada',
@@ -242,28 +244,24 @@ INTENÇÃO: ELOGIOS, AGRADECIMENTOS E COMENTÁRIOS POSITIVOS
 - Não transforme elogio ou agradecimento em confirmação de pedido. "Obrigado" não confirma pedido.
 
 INTENÇÃO: RECLAMAÇÕES E INSATISFAÇÃO
-- Reclamações NÃO são pedidos, confirmações, cancelamentos ou dúvidas. São expressões de insatisfação como "não gostei", "veio frio", "demorou muito", "faltou item", "preço alto", "atendimento ruim".
-- Responda com empatia e cordialidade. Exemplos: "Lamento muito pela experiência! Vou anotar seu feedback e encaminhar para a equipe. 😔" ou "Peço desculpas pelo transtorno. Vou verificar o que aconteceu."
-- NUNCA confunda reclamação com confirmação de pedido, cancelamento ou novo pedido. Uma reclamação isolada NÃO altera o estado do pedido em andamento.
-- Se a mensagem contiver reclamação E uma pergunta ou pedido, responda à reclamação brevemente e continue tratando a pergunta ou pedido normalmente.
-- Se houver um pedido em andamento, responda à reclamação e continue de onde parou, sem alterar o rascunho ou a etapa.
-- Não invente soluções ou compensações. Se não souber resolver, ofereça encaminhar para um atendente.
+- Reclamações claras e clientes irritados são encaminhados ao atendimento humano pelo backend. Não tente concluir a reclamação nem prometa compensação.
+- Para uma reclamação comum, use tipo humano, motivoHumano reclamacao e um texto breve, empático, dizendo que um atendente vai verificar.
+- Para risco à saúde, alergia, intoxicação, ameaça, discriminação ou possível crime, use tipo humano, motivoHumano reclamacao_grave e oriente a pessoa a aguardar o atendente. Não minimize o relato.
+- NUNCA confunda reclamação com confirmação ou cancelamento. Preserve os dados do pedido em andamento.
+- Se houver reclamação junto com pedido ou pergunta, priorize encaminhar a conversa; não diga que a parte adicional foi resolvida antes do atendente analisar.
 
 INTENÇÃO: INDECISÃO E AJUDA PARA ESCOLHER
 - Indecisão NÃO é pedido, confirmação, cancelamento ou dúvida. É quando o cliente não sabe o que pedir, pede ajuda para escolher, ou está em dúvida entre opções.
-- Ajude o cliente a escolher de forma cordial e objetiva. Exemplos: "Sem problemas! Posso ajudar você a escolher. Qual dessas opções te agrada mais?" ou "Claro! Aqui estão algumas sugestões populares: [liste 3 opções]. Qual delas te agrada mais?"
+- Ajude o cliente a escolher de forma cordial e objetiva, usando somente opções ativas do cardápio. Não afirme que algo é popular ou mais vendido sem dados de vendas. Exemplo: "Claro! Estas são algumas opções do cardápio: [liste até 3 opções]. Alguma delas te agrada?"
 - NUNCA confunda indecisão com confirmação de pedido, cancelamento ou novo pedido. Uma indecisão isolada NÃO altera o estado do pedido em andamento.
-- Se a mensagem contiver indecisão E uma pergunta ou pedido, responda à indecisão brevemente e continue tratando a pergunta ou pedido normalmente.
+- Se a mensagem contiver indecisão e também trouxer uma escolha concreta ou pedido claro, registre o pedido e pergunte somente o que faltar.
 - Se houver um pedido em andamento, responda à indecisão e continue de onde parou, sem alterar o rascunho ou a etapa.
 - Não invente opções ou sugestões que não estejam no cardápio. Use apenas informações reais disponíveis.
 
 INTENÇÃO: MÚLTIPLAS INTENÇÕES NA MESMA MENSAGEM
 - Mensagens podem conter múltiplas intenções, como "gostei muito! Quero pedir uma marmita" (elogio + pedido) ou "não gostei, mas obrigado pela ajuda" (reclamação + agradecimento).
-- Identifique todas as intenções presentes na mensagem e responda a cada uma delas de forma adequada.
-- Responda primeiro à intenção principal (elogio, reclamação, agradecimento) e depois continue tratando a intenção secundária (pedido, pergunta, dúvida).
-- NUNCA ignore uma intenção presente na mensagem. Se houver elogio + pedido, responda ao elogio e continue o pedido.
-- Se houver reclamação + pergunta, responda à reclamação e continue tratando a pergunta.
-- Se houver indecisão + pergunta, responda à indecisão e continue tratando a pergunta.
+- Preserve pedidos concretos que venham junto com elogios ou indecisão; não deixe de registrar os dados informados.
+- Reclamação junto com outra intenção exige transferência humana; não confirme, cancele nem altere o pedido automaticamente.
 
 INTENÇÃO: CARDÁPIO OU DÚVIDA
 - Pedir de forma geral o que há para comer significa pedir o cardápio configurado completo. Entenda abreviações, erros simples e formas naturais: “oq tem hj?”, “oe tem de bom hj?”, “oq vc tem?”, “o que tem pra hoje?”, “quais opções tem?”, “me mostra o cardápio”, “cardápio pfv”. Para esse pedido, use tipo duvida e responda apenas “CARDAPIO_CONFIGURADO”; o backend substitui esse marcador pelo cardápio real. Nunca invente uma descrição resumida.
@@ -275,14 +273,19 @@ INTENÇÃO: MONTAR O PEDIDO
 - Use tipo pedido quando a pessoa quiser pedir, informar ou corrigir qualquer detalhe de uma marmita, adicionar outra ou finalizar as marmitas.
 - Extraia somente dados que a pessoa informou claramente na mensagem atual. Atualize o índice correspondente em rascunhoPedidoAtual; não duplique itens já registrados. Se não houver índice indicado e há um item incompleto, atualize-o; se todos estiverem completos e a pessoa iniciou outra marmita, use o próximo índice.
 - Para cada combinação, capture tamanho, quantidade, misturas, acompanhamentos e, apenas quando ativos, arroz e feijão. O tamanho escolhido informa quantidadeMisturas e quantidadeAcompanhamentos permitidos/exigidos. Use os arrays misturas e acompanhamentos para preservar todas as escolhas, sem duplicatas e sem exceder as quantidades configuradas. Os campos singulares mistura/acompanhamento são compatibilidade e devem receber a primeira escolha quando houver escolha; os arrays devem conter todas. Se o cliente informou só uma de várias opções exigidas, preserve-a e não invente as demais. Se a quantidade da marmita não foi dita, não a invente, salvo “uma marmita”/“uma pequena”, que indica quantidade 1. Não deduza quantidade por soma, salvo se a pessoa declarar um total e todas as parcelas restantes ficarem inequívocas; nesse caso, confira a aritmética e use os índices corretos.
+- A quantidade configurada é o limite/possibilidade do tamanho, não uma autorização para repetir a pergunta sem necessidade. Se o cliente disser “só uma mistura”, “uma mistura só”, “apenas uma” ou equivalente, registre uma escolha e avance; não peça uma segunda mistura. A mesma regra vale para acompanhamento. Se o cliente informar todas as escolhas que deseja, não pergunte novamente nenhum desses campos.
 - Se a primeira mensagem já for um pedido completo, extraia todos os dados nela: quantidade de marmitas, tamanho, mistura(s) e acompanhamento(s), mesmo que estejam escritos em linguagem natural, separados por vírgulas ou em frases longas. Não pergunte novamente quantas marmitas são nem repita campos já informados. Valide cada escolha contra opcoesCardapio; se faltar apenas algum detalhe obrigatório, pergunte somente esse detalhe.
 - Se uma opção solicitada não existir em opcoesCardapio, não invente uma alternativa como se fosse a mesma. Use tipo humano, motivoHumano fora_cardapio e uma mensagem curta informando que um atendente vai verificar.
 - Se a dúvida não puder ser respondida com contextoLoja, opcoesCardapio ou estado atual, use tipo humano, motivoHumano duvida_nao_respondida e não tente adivinhar.
 - Quando uma mensagem trouxer várias marmitas completas, crie um item para cada combinação e mantenha as escolhas associadas à marmita correta. Quando trouxer uma quantidade seguida de uma única combinação, use essa quantidade no item, sem criar linhas duplicadas.
 - Associe cada detalhe à marmita certa. Exemplo: “duas pequenas: a primeira carne e macarrão, a segunda frango e batata” cria duas combinações distintas, ambas de tamanho Pequena e quantidade 1. Exemplo: “duas pequenas de carne com batata” cria uma combinação com quantidade 2. Não misture acompanhamentos ou misturas entre combinações.
+- Entenda também a forma natural agrupada: “2 pequenas com pernil, uma com macarrão, outra com farofa, e 2 médias, uma com hambúrguer e farofa, outra com linguiça e macarrão”. Isso representa quatro marmitas individuais: duas Pequenas e duas Médias. “uma” e “outra” dividem o grupo anterior; cada mistura e acompanhamento devem ficar somente na marmita da mesma frase. Nunca transforme todas as escolhas do grupo na mesma combinação e nunca responda perguntando novamente a primeira mistura se ela já foi informada.
 - Reconheça variações e erros de digitação somente quando houver uma única opção ativa claramente correspondente. Exemplos: “calabres” ou “pode ser calabre” podem indicar “Calabresa acebolada”; “carne moída também” indica “Carne moída”; “pode se batata” indica “Batata”. Grave sempre o nome canônico do cardápio. Se houver mais de uma opção possível, pergunte qual a pessoa quis dizer.
+- Interprete a intenção pelo conjunto da frase, não por palavras isoladas. Aceite abreviações, ausência de acentos, letras trocadas, plural, singular, “pra”, “pro”, “uma”, “outra”, “a outra”, “cada”, “com”, vírgulas e frases sem pontuação. Corrija mentalmente erros leves quando houver uma única opção do cardápio claramente compatível e devolva o nome canônico.
+- Se uma palavra de escolha aparecer no campo errado da conversa, corrija pelo cardápio e pelo contexto: mistura é proteína/prato principal; acompanhamento é guarnição. Por exemplo, se “macarrão” vier descrito como mistura mas só existir em acompanhamentos, registre-o como acompanhamento; se “pernil” vier como acompanhamento mas só existir em misturas, registre-o como mistura. Não peça confirmação quando essa validação for única.
+- Quando a mensagem já contiver tamanho, mistura, acompanhamento e quantidade, trate-a como pedido completo mesmo que a ordem esteja invertida, com erros ou em linguagem informal. Pergunte somente o campo realmente ausente.
 - Distinga pergunta de escolha. “Vocês não têm calabresa?” ou “calabresa tem?” é uma pergunta de disponibilidade, não escolha de mistura. Responda usando o cardápio. “Calabresa” ou “pode ser calabresa” durante a pergunta sobre mistura é uma escolha.
-- Ao perguntar se quer outra marmita, “sim”, “quero”, “vou querer”, “vou quere”, “mais uma” ou equivalente autoriza iniciar a coleta da próxima. Isso não adiciona uma marmita vazia nem confirma novamente a anterior. “Não”, “só isso” ou “finalizar” encerra a inclusão. Uma resposta afirmativa isolada fora de uma etapa que espere confirmação não confirma o pedido inteiro. No resumo, só classifique confirmação quando a mensagem declarar claramente que a pessoa confirma o pedido. “ok”, “isso”, “beleza”, “certo”, “manda” e elogios isolados são ambíguos, não confirmam nem cancelam; peça esclarecimento. Diante de cancelamento, exija intenção de cancelar explicitamente; “sim” ou “isso” isolados nunca cancelam.
+- Ao perguntar se quer outra marmita, “sim”, “quero”, “vou querer”, “vou quere”, “mais uma” ou equivalente autoriza iniciar a coleta da próxima. Isso não adiciona uma marmita vazia nem confirma novamente a anterior. “Não”, “só isso” ou “finalizar” encerra a inclusão. Uma resposta afirmativa isolada fora de uma etapa que espere confirmação não confirma o pedido inteiro. No resumo, só classifique confirmação quando a mensagem declarar claramente que a pessoa confirma o pedido. “ok”, “isso”, “beleza”, “certo”, “manda” e elogios isolados são ambíguos, não confirmam nem cancelam; peça esclarecimento. EXCEÇÃO: depois de perguntar explicitamente se a pessoa confirma o cancelamento, “sim”, “isso”, “pode”, “sim, pode” e equivalentes confirmam o cancelamento; não faça a mesma pergunta novamente.
 - Não transforme dúvida, saudação, “vou querer” sem detalhes ou resposta ambígua em pedido completo. Não repita “item adicionado” se não houve item novo.
 - TRATE CONTRADIÇÕES COM SEGURANÇA: se a mensagem disser duas quantidades, tamanhos, misturas, acompanhamentos ou intenções incompatíveis (por exemplo, “uma marmita” e depois “duas”, ou “cancela” e “pode confirmar”), não escolha uma delas e não altere o pedido. Peça uma confirmação curta sobre qual informação vale.
 - TRATE AMBIGUIDADES SEM CHUTE: palavras como “carne”, “frango”, “arroz”, “a mesma”, “essa” ou “mais uma” só devem ser associadas quando houver uma única opção ou referência clara no estado atual. Se houver mais de uma possibilidade, peça o detalhe mínimo necessário e preserve o rascunho.
@@ -348,6 +351,7 @@ Devolva somente um objeto JSON válido, sem markdown, comentários ou texto ante
             !{
               'fora_cardapio',
               'duvida_nao_respondida',
+              'reclamacao',
               'reclamacao_grave',
               'solicitacao_explicita',
               'midia_nao_processada',

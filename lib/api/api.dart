@@ -49,8 +49,8 @@ class Api {
       final rows = banco.db.select(
           'SELECT payload, criado_em FROM webhook_entrada ORDER BY rowid LIMIT 100');
       final registros = rows.map((row) {
-        final mensagem = jsonDecode(row['payload'] as String)
-            as Map<String, dynamic>;
+        final mensagem =
+            jsonDecode(row['payload'] as String) as Map<String, dynamic>;
         return (
           mensagem: mensagem,
           criadoEm: DateTime.tryParse(row['criado_em']?.toString() ?? '')
@@ -79,35 +79,52 @@ class Api {
 
       const janelaResposta = Duration(seconds: 10);
       final telefonesComTextoPendente = ultimoTextoPorTelefone.entries
-          .where((entry) =>
-              agora.difference(entry.value) < janelaResposta)
+          .where((entry) => agora.difference(entry.value) < janelaResposta)
           .map((entry) => entry.key)
           .toSet();
       final grupos = <Map<String, dynamic>>[];
+      final ultimoGrupoPorTelefone = <String, Map<String, dynamic>>{};
       for (final registro in registros) {
         final m = registro.mensagem;
         final podeAgrupar = m['tipo'] == 'text' &&
             (m['respostaId'] == null || m['respostaId'].toString().isEmpty);
         final telefone = m['telefone']?.toString();
-        // Se ainda há uma mensagem recente desse cliente, aguarde a sequência
-        // inteira. Assim a janela começa na última mensagem, e não na primeira.
-        if (podeAgrupar &&
-            telefone != null &&
-            telefonesComTextoPendente.contains(telefone)) {
+        // Preserve a ordem da conversa: se há texto recente, retenha também
+        // mídia e respostas interativas desse cliente até fechar a janela.
+        if (telefone != null && telefonesComTextoPendente.contains(telefone)) {
           continue;
         }
-        final ultimo = grupos.isEmpty ? null : grupos.last;
+        final criadoEm = registro.criadoEm?.toUtc();
+        final ultimo =
+            telefone == null ? null : ultimoGrupoPorTelefone[telefone];
+        final horaUltimo = DateTime.tryParse(
+          ultimo?['_ultimoTextoEm']?.toString() ?? '',
+        );
+        final intervalo = criadoEm != null && horaUltimo != null
+            ? criadoEm.difference(horaUltimo)
+            : null;
         if (podeAgrupar &&
             ultimo != null &&
-            ultimo['telefone'] == m['telefone'] &&
-            ultimo['tipo'] == 'text') {
+            intervalo != null &&
+            !intervalo.isNegative &&
+            intervalo <= janelaResposta) {
           ultimo['texto'] = '${ultimo['texto']}\n${m['texto']}'.trim();
           (ultimo['_ids'] as List).add(m['id']);
+          ultimo['_ultimoTextoEm'] = criadoEm!.toIso8601String();
         } else {
-          grupos.add({
+          if (telefone != null && !podeAgrupar) {
+            ultimoGrupoPorTelefone.remove(telefone);
+          }
+          final grupo = {
             ...m,
-            '_ids': [m['id']]
-          });
+            '_ids': [m['id']],
+            if (podeAgrupar && criadoEm != null)
+              '_ultimoTextoEm': criadoEm.toIso8601String(),
+          };
+          grupos.add(grupo);
+          if (podeAgrupar && telefone != null) {
+            ultimoGrupoPorTelefone[telefone] = grupo;
+          }
         }
       }
       for (final m in grupos) {
@@ -125,8 +142,17 @@ class Api {
               respostaId: m['respostaId'],
               enviadaEm: DateTime.tryParse(m['enviadaEm'] ?? '')));
           final ids = (m['_ids'] as List).skip(1).toList();
-          for (final id in ids) {
-            banco.db.execute('DELETE FROM webhook_entrada WHERE id = ?', [id]);
+          if (ids.isNotEmpty) banco.db.execute('BEGIN IMMEDIATE');
+          try {
+            for (final id in ids) {
+              banco.registrarMensagemAgrupadaComoProcessada(id.toString());
+              banco.db
+                  .execute('DELETE FROM webhook_entrada WHERE id = ?', [id]);
+            }
+            if (ids.isNotEmpty) banco.db.execute('COMMIT');
+          } catch (_) {
+            if (ids.isNotEmpty) banco.db.execute('ROLLBACK');
+            rethrow;
           }
         } catch (e) {
           banco.log('ERROR', 'webhook_processamento', e.runtimeType.toString());
