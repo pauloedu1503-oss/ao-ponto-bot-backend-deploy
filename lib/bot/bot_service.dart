@@ -28,10 +28,27 @@ class BotService {
       String? motivoTransferenciaIA;
       String? tipoInterpretacaoIA;
       var iaFalhou = false;
+      String? horarioRetiradaPedidoAtivo;
+      var editarPedidoRecente = false;
       final etapaAntes =
           banco.obterSessao(msg.telefone)?['etapa']?.toString() ?? 'inicio';
       try {
         final sessaoAtual = banco.obterSessao(msg.telefone);
+        final horarioMencionado =
+            _horarioRetiradaMencionado(mensagemProcessada.entrada);
+        final etapaAtual = sessaoAtual?['etapa']?.toString() ?? 'inicio';
+        final pedidoAguardando = banco.pedidoAguardandoPreparo(msg.telefone);
+        editarPedidoRecente = pedidoAguardando != null &&
+            _mensagemPedeAlteracaoPedidoEnviado(mensagemProcessada.entrada);
+        final anotacaoHorarioEmAndamento = horarioMencionado != null &&
+            etapaAtual != 'inicio' &&
+            _mensagemEhSoHorarioRetirada(mensagemProcessada.entrada);
+        if (horarioMencionado != null &&
+            etapaAtual == 'inicio' &&
+            banco.temPedidoAtivo(msg.telefone) &&
+            !_mensagemIniciaNovoPedido(mensagemProcessada.entrada)) {
+          horarioRetiradaPedidoAtivo = horarioMencionado;
+        }
         if (!msg.temLocalizacao &&
             msg.ehMidia &&
             sessaoAtual?['modoHumano'] != true) {
@@ -60,7 +77,11 @@ class BotService {
                 )
             ? _capturarBebidaAdicional(mensagemProcessada.entrada)
             : null;
-        if (msg.temLocalizacao || motivoTransferenciaIA != null) {
+        if (editarPedidoRecente ||
+            horarioRetiradaPedidoAtivo != null ||
+            anotacaoHorarioEmAndamento ||
+            msg.temLocalizacao ||
+            motivoTransferenciaIA != null) {
           // Localização e mídia inconclusiva já têm tratamento determinístico.
           // Não envie essas entradas outra vez para a IA.
         } else if (bebidaNoResumo != null) {
@@ -126,6 +147,8 @@ class BotService {
           mensagemProcessada,
           respostaIA: respostaIA,
           pedidoIA: pedidoIA,
+          horarioRetiradaPedidoAtivo: horarioRetiradaPedidoAtivo,
+          editarPedidoRecente: editarPedidoRecente,
         );
         final etapaDepois =
             banco.obterSessao(msg.telefone)?['etapa']?.toString() ?? 'inicio';
@@ -241,6 +264,12 @@ class BotService {
     if (sessao?['modoHumano'] == true || _sessaoExpirou(sessao, config)) {
       return null;
     }
+    if (_perguntaSobreTempoDePedido(msg.entrada)) {
+      return const InterpretacaoAtendimento(
+        'duvida',
+        'Em torno de 20 a 40 minutos, 😊',
+      );
+    }
     final trocaEntreCategorias =
         _respostaTrocaEntreCategorias(msg.entrada, banco.obterCardapio());
     if (trocaEntreCategorias != null) {
@@ -281,6 +310,19 @@ class BotService {
       return InterpretacaoAtendimento('duvida', respostaConhecida);
     }
     final etapaAtual = sessao?['etapa']?.toString() ?? 'inicio';
+    final opcaoDesativada = _opcaoDesativadaMencionada(entrada);
+    if (opcaoDesativada != null &&
+        const {'ia_pedido', 'mistura', 'acompanhamento', 'confirmacao'}
+            .contains(etapaAtual)) {
+      final categoria = opcaoDesativada['categoria']!;
+      final nome = opcaoDesativada['nome']!;
+      final complemento = categoria == 'mistura' ? 'mistura' : 'acompanhamento';
+      return InterpretacaoAtendimento(
+        'duvida',
+        'A $complemento $nome acabou por hoje e não pode ser incluída no pedido. '
+            'Qual outra opção você prefere?',
+      );
+    }
     if (etapaAtual == 'inicio' &&
         _ehPedidoDeUmaMarmitaSemDetalhes(msg.entrada)) {
       return const InterpretacaoAtendimento(
@@ -378,19 +420,32 @@ class BotService {
         );
       }
       final compostas = _capturarOpcoesPedidoCompostas(msg.entrada, sessao);
-      if (compostas != null) {
+      final tamanhos = _capturarTamanhosPedido(
+        msg.entrada,
+        sessao,
+        permitirTamanhoSemQuantidade: compostas != null,
+      );
+      if (compostas != null || tamanhos != null) {
+        final itensCombinados = <int, Map<String, dynamic>>{};
+        for (final item in tamanhos ?? const <Map<String, dynamic>>[]) {
+          final indice = (item['indice'] as num?)?.toInt();
+          if (indice != null) {
+            itensCombinados[indice] = Map<String, dynamic>.from(item);
+          }
+        }
+        for (final item in compostas ?? const <Map<String, dynamic>>[]) {
+          final indice = (item['indice'] as num?)?.toInt();
+          if (indice != null) {
+            itensCombinados.putIfAbsent(indice, () => {'indice': indice})
+              ..addAll(item);
+          }
+        }
+        final itens = itensCombinados.values.toList()
+          ..sort((a, b) => (a['indice'] as int).compareTo(b['indice'] as int));
         return InterpretacaoAtendimento(
           'pedido',
           '',
-          pedido: {'itens': compostas, 'finalizarItens': false},
-        );
-      }
-      final tamanhos = _capturarTamanhosPedido(msg.entrada, sessao);
-      if (tamanhos != null) {
-        return InterpretacaoAtendimento(
-          'pedido',
-          '',
-          pedido: {'itens': tamanhos, 'finalizarItens': false},
+          pedido: {'itens': itens, 'finalizarItens': false},
         );
       }
       final capturaDireta = _capturarOpcaoPedidoCurta(msg.entrada, sessao);
@@ -581,6 +636,9 @@ class BotService {
     String telefone,
     String nome,
   ) {
+    if (_perguntaSobreTempoDePedido(entrada)) {
+      return 'Em torno de 20 a 40 minutos, 😊';
+    }
     if (_cidadeMencionada(entrada) != null &&
         (_contemTermo(entrada, ['entrega', 'taxa', 'cobra']) ||
             _parecePerguntaDoCliente(entrada))) {
@@ -731,6 +789,19 @@ class BotService {
     }
 
     final cardapio = banco.obterCardapio();
+    final opcaoDesativada = _opcaoDesativadaMencionada(entrada);
+    if (opcaoDesativada != null &&
+        _parecePerguntaDoCliente(entrada) &&
+        _contemTermo(entrada, [
+          'tem',
+          'vende',
+          'disponivel',
+          'disponiveis',
+          'acabou',
+          'sobrou',
+        ])) {
+      return 'A opção ${opcaoDesativada['nome']} acabou por hoje e não pode ser incluída no pedido.';
+    }
     if (_parecePerguntaDoCliente(entrada)) {
       final perguntaDisponibilidade = _contemTermo(
         entrada,
@@ -766,13 +837,81 @@ class BotService {
           if (perguntaDisponibilidade) {
             return opcao['ativo'] == true
                 ? 'Sim, $nome está disponível.'
-                : 'No momento, $nome não está disponível.';
+                : '$nome acabou por hoje e não pode ser incluído no pedido.';
           }
         }
       }
     }
 
     return null;
+  }
+
+  Map<String, String>? _opcaoDesativadaMencionada(String entrada) {
+    final texto = _normalizarIntencao(entrada);
+    if (texto.isEmpty) return null;
+    final cardapio = banco.obterCardapio();
+    for (final (chave, categoria) in const [
+      ('misturas', 'mistura'),
+      ('acompanhamentos', 'acompanhamento'),
+    ]) {
+      final opcoes = (cardapio[chave] as List? ?? const [])
+          .whereType<Map>()
+          .map((item) => Map<String, dynamic>.from(item))
+          .toList();
+      var correspondencias = opcoes.where((opcao) {
+        final nomes = <String>[
+          opcao['nome']?.toString() ?? '',
+          ...((opcao['aliases'] as List? ?? const [])
+              .map((alias) => alias.toString())),
+        ];
+        return nomes.any((nome) {
+          final normalizado = _normalizarIntencao(nome);
+          return normalizado.isNotEmpty &&
+              RegExp(r'(?:^| )' + RegExp.escape(normalizado) + r'(?: |$)')
+                  .hasMatch(texto);
+        });
+      }).toList();
+      if (correspondencias.isEmpty) {
+        final idsMencionados = _opcoesMencionadasNaFrase(entrada, opcoes);
+        if (idsMencionados.length == 1) {
+          correspondencias = opcoes
+              .where(
+                  (opcao) => opcao['id']?.toString() == idsMencionados.single)
+              .toList();
+        }
+      }
+      // Se a frase identificar mais de uma opção, não adivinhamos qual delas
+      // está indisponível: a interpretação normal pode pedir esclarecimento.
+      if (correspondencias.length == 1 &&
+          correspondencias.single['ativo'] != true) {
+        return {
+          'nome': correspondencias.single['nome']?.toString() ?? 'Essa opção',
+          'categoria': categoria,
+        };
+      }
+    }
+    return null;
+  }
+
+  bool _perguntaSobreTempoDePedido(String entrada) {
+    final texto = _normalizarIntencao(entrada);
+    final perguntaDeTempo = [
+      RegExp(
+        r'\b(quanto tempo|que tempo|qual o tempo|qual tempo|demora quanto|quanto demora|vai demorar|leva quanto|quanto leva|em quanto tempo|quanto costuma demorar)\b',
+      ),
+      RegExp(
+        r'\b(quando|que horas|pra quando|para quando)\b.{0,35}\b(fica pronto|fica pronta|fica|sai|chega|entrega|recebo|posso buscar|posso retirar)\b',
+      ),
+      RegExp(
+        r'\b(fica pronto|fica pronta|sai|chega|entrega|recebo|posso buscar|posso retirar)\b.{0,35}\b(quando|que horas|em quanto tempo)\b',
+      ),
+      RegExp(
+        r'\b(previsao|prazo|tempo de preparo|tempo de entrega|tempo para preparar|tempo para entregar)\b',
+      ),
+    ].any((padrao) => padrao.hasMatch(texto));
+    if (!perguntaDeTempo) return false;
+    // Reclamações sobre atraso seguem o fluxo de reclamação e atendimento humano.
+    return !_ehReclamacao(texto);
   }
 
   bool _ehPerguntaIsoladaDeValor(String entrada) => RegExp(
@@ -889,6 +1028,15 @@ class BotService {
     Map<String, dynamic> captura,
   ) async {
     final dados = Map<String, dynamic>.from(sessao?['dados'] as Map? ?? {});
+    final horarioRetirada = _horarioRetiradaMencionado(msg.entrada);
+    if (horarioRetirada != null) {
+      _aplicarHorarioRetirada(config, dados, horarioRetirada);
+      await whatsapp.enviarTexto(
+        msg.telefone,
+        'Combinado! Vou incluir no pedido que você pretende buscar às '
+        '$horarioRetirada. 😊',
+      );
+    }
     final observacaoNoPedido = _extrairObservacaoNoMeioDoPedido(msg.entrada);
     if (observacaoNoPedido != null) {
       dados['observacao'] = observacaoNoPedido;
@@ -1327,9 +1475,21 @@ class BotService {
           : null;
 
       if (tamanho == null) {
-        // Cada marmita é coletada com a mesma pergunta simples. Os índices
-        // continuam apenas no estado interno para associar as respostas.
-        perguntaPendente = _perguntaDetalhesPrimeiraMarmita(cardapio);
+        final jaTemOutrosDetalhes = arroz != null ||
+            feijao != null ||
+            misturas.isNotEmpty ||
+            acompanhamentos.isNotEmpty;
+        if (jaTemOutrosDetalhes) {
+          final referencia = _referenciaMarmitaIa(
+            itens,
+            i,
+            totalSolicitado: rascunho['quantidadeTotalSolicitada'] as num?,
+          );
+          perguntaPendente = 'Qual tamanho você prefere $referencia?';
+        } else {
+          // Começa coletando a marmita, mas não repete campos já informados.
+          perguntaPendente = _perguntaDetalhesPrimeiraMarmita(cardapio);
+        }
       } else if (arrozAtivo && arroz == null) {
         final referencia = _referenciaMarmitaIa(
           itens,
@@ -1662,6 +1822,224 @@ class BotService {
       return null;
     }
     return observacao;
+  }
+
+  bool _mensagemPedeAlteracaoPedidoEnviado(String entrada) {
+    final texto = _normalizarIntencao(entrada);
+    final pedeMudanca = RegExp(
+      r'\b(troca|trocar|muda|mudar|altera|alterar|substitui|substituir|acrescenta|adiciona|inclui|anota|retifica|corrige)\b',
+    ).hasMatch(texto);
+    final citaCampo = RegExp(
+      r'\b(mistura|misturas|acompanhamento|acompanhamentos|observacao|obs)\b',
+    ).hasMatch(texto);
+    final cardapio = banco.obterCardapio();
+    final citaOpcao = [
+      ..._itensAtivos(cardapio, 'misturas'),
+      ..._itensAtivos(cardapio, 'acompanhamentos'),
+    ].any((opcao) => _opcoesMencionadasNaFrase(entrada, [opcao]).isNotEmpty);
+    return (pedeMudanca &&
+            (citaCampo ||
+                citaOpcao ||
+                RegExp(r'\b(troca|trocar|muda|mudar|altera|alterar|substitui|substituir)\b')
+                    .hasMatch(texto))) ||
+        RegExp(r'^(?:obs|observacao)\s*[:=-]').hasMatch(texto);
+  }
+
+  Future<void> _editarPedidoRecenteEnviado(MensagemWhatsApp msg) async {
+    final pedido = banco.pedidoRecenteEditavel(msg.telefone);
+    if (pedido == null) {
+      await whatsapp.enviarTexto(
+        msg.telefone,
+        'Esse pedido já passou do prazo de 5 minutos para alterações. Posso ajudar com um novo pedido ou chamar um atendente.',
+      );
+      return;
+    }
+    final entrada = msg.entrada.trim();
+    final itens = (pedido['itens'] as List? ?? const [])
+        .whereType<Map>()
+        .map((raw) => Map<String, dynamic>.from(raw))
+        .toList();
+    var observacao = pedido['observacao']?.toString();
+    final textoNormalizado = _normalizarIntencao(entrada);
+    final mencionaObservacao =
+        RegExp(r'\b(obs|observacao)\b').hasMatch(textoNormalizado);
+    var observacaoAtualizada = false;
+    if (mencionaObservacao) {
+      final extraida = RegExp(
+        r'^\s*(?:(?:acrescenta|adiciona|inclui|anota|anote|obs(?:ervacao)?|observacao)(?:\s+uma)?(?:\s+observacao)?|pode\s+anotar)\s*[:=-]?\s*(.+)$',
+      ).firstMatch(textoNormalizado)?.group(1)?.trim();
+      if (extraida == null || extraida.isEmpty || extraida.length > 300) {
+        await whatsapp.enviarTexto(
+          msg.telefone,
+          'Claro! Qual observação você quer acrescentar ao pedido?',
+        );
+        return;
+      }
+      final atual = observacao?.trim() ?? '';
+      if (atual.isEmpty) {
+        observacao = extraida;
+      } else if (!_normalizar(atual).contains(_normalizar(extraida))) {
+        observacao = '$atual; $extraida';
+      }
+      observacaoAtualizada = true;
+    }
+
+    final citaMistura = RegExp(r'\bmistura(s)?\b').hasMatch(textoNormalizado);
+    final citaAcompanhamento =
+        RegExp(r'\bacompanhamento(s)?\b').hasMatch(textoNormalizado);
+    final pedeTroca = RegExp(
+      r'\b(troca|trocar|muda|mudar|altera|alterar|substitui|substituir)\b',
+    ).hasMatch(textoNormalizado);
+    if (citaMistura || citaAcompanhamento || pedeTroca) {
+      final cardapio = banco.obterCardapio();
+      final rascunhoItens = itens.map((item) {
+        final misturas = item['misturaNomes'] is List
+            ? List<String>.from(item['misturaNomes'] as List)
+            : [if (item['misturaNome'] != null) item['misturaNome'].toString()];
+        final acompanhamentos = item['acompanhamentoNomes'] is List
+            ? List<String>.from(item['acompanhamentoNomes'] as List)
+            : [
+                if (item['acompanhamentoNome'] != null)
+                  item['acompanhamentoNome'].toString()
+              ];
+        return <String, dynamic>{
+          'misturas': misturas,
+          'mistura': misturas.isEmpty ? null : misturas.first,
+          'acompanhamentos': acompanhamentos,
+          'acompanhamento':
+              acompanhamentos.isEmpty ? null : acompanhamentos.first,
+          'quantidadeMisturas': item['quantidadeMisturas'] ?? 1,
+          'quantidadeAcompanhamentos': item['quantidadeAcompanhamentos'] ?? 1,
+          'tamanho': item['tamanhoNome'],
+          'quantidade': item['quantidade'] ?? 1,
+        };
+      }).toList();
+      final sessaoTemporaria = {
+        'dados': {
+          'rascunhoPedidoIA': {'itens': rascunhoItens}
+        }
+      };
+      final correcao = _interpretarCorrecaoDeItem(entrada, sessaoTemporaria);
+      final trocaDireta = RegExp(
+        r'\b(?:troca|trocar|muda|mudar|altera|alterar)\s+(?:a|o|as|os)?\s*(.+?)\s+(?:por|para|no lugar de)\s+(.+)$',
+      ).firstMatch(textoNormalizado);
+      final correcaoDireta = trocaDireta == null
+          ? null
+          : _correcaoDiretaPedidoEnviado(
+              trocaDireta.group(1)!, trocaDireta.group(2)!, itens);
+      final correcaoFinal = correcaoDireta ?? correcao;
+      if (correcaoFinal == null) {
+        await whatsapp.enviarTexto(
+          msg.telefone,
+          'Quero fazer a alteração certinha. Diga o que quer trocar e por qual opção do cardápio. Se houver mais de uma marmita, indique o tamanho ou a opção atual.',
+        );
+        return;
+      }
+      final indice = (correcaoFinal['indice'] as num).toInt() - 1;
+      if (indice < 0 || indice >= itens.length) {
+        await whatsapp.enviarTexto(
+          msg.telefone,
+          'Não consegui identificar qual marmita você quer alterar. Pode indicar o tamanho ou a opção atual?',
+        );
+        return;
+      }
+      final campo = correcaoFinal['substituirCampo']?.toString();
+      final plural = campo == 'mistura' ? 'misturas' : 'acompanhamentos';
+      final nomesCampo =
+          campo == 'mistura' ? 'misturaNomes' : 'acompanhamentoNomes';
+      final idsCampo = campo == 'mistura' ? 'misturaIds' : 'acompanhamentoIds';
+      final nomeCampo =
+          campo == 'mistura' ? 'misturaNome' : 'acompanhamentoNome';
+      final idCampo = campo == 'mistura' ? 'misturaId' : 'acompanhamentoId';
+      final opcoes = _itensAtivos(cardapio, plural);
+      final opcao = _resolverOpcaoNatural(correcaoFinal[campo], opcoes);
+      if (opcao == null) {
+        await whatsapp.enviarTexto(
+          msg.telefone,
+          'Essa opção não está disponível no cardápio atual. ${_opcoesEmTexto(opcoes)}',
+        );
+        return;
+      }
+      final item = itens[indice];
+      final nomes = item[nomesCampo] is List
+          ? List<String>.from(item[nomesCampo] as List)
+          : [if (item[nomeCampo] != null) item[nomeCampo].toString()];
+      final ids = item[idsCampo] is List
+          ? List<String>.from(item[idsCampo] as List)
+          : [if (item[idCampo] != null) item[idCampo].toString()];
+      final posicao = (correcaoFinal['substituirIndice'] as num?)?.toInt() ?? 0;
+      if (posicao < 0 || posicao >= nomes.length || posicao >= ids.length) {
+        await whatsapp.enviarTexto(
+          msg.telefone,
+          'Não consegui confirmar qual escolha substituir. Diga a opção atual e a nova, por exemplo: “troca batata por macarrão”.',
+        );
+        return;
+      }
+      nomes[posicao] = opcao['nome'].toString();
+      ids[posicao] = opcao['id'].toString();
+      item[nomesCampo] = nomes;
+      item[idsCampo] = ids;
+      item[nomeCampo] = nomes.first;
+      item[idCampo] = ids.first;
+      observacaoAtualizada = true;
+    }
+
+    if (!observacaoAtualizada) {
+      await whatsapp.enviarTexto(
+        msg.telefone,
+        'Não consegui identificar uma alteração válida. Nenhuma mudança foi feita. Diga o que deseja trocar ou qual observação quer acrescentar.',
+      );
+      return;
+    }
+    final atualizado = banco.atualizarDetalhesPedidoRecente(
+      id: (pedido['id'] as num).toInt(),
+      itens: itens,
+      observacao: observacao,
+    );
+    if (atualizado == null) {
+      await whatsapp.enviarTexto(
+        msg.telefone,
+        'O prazo de alteração terminou enquanto eu verificava. Não alterei o pedido; vou chamar um atendente para ajudar.',
+      );
+      return;
+    }
+    await whatsapp.enviarTexto(
+      msg.telefone,
+      'Prontinho! Atualizei o pedido #${atualizado['numero']} com essa alteração. 😊',
+    );
+  }
+
+  Map<String, dynamic>? _correcaoDiretaPedidoEnviado(
+    String origem,
+    String destino,
+    List<Map<String, dynamic>> itens,
+  ) {
+    final cardapio = banco.obterCardapio();
+    final categorias = {
+      'mistura': _itensAtivos(cardapio, 'misturas'),
+      'acompanhamento': _itensAtivos(cardapio, 'acompanhamentos'),
+    };
+    for (final entry in categorias.entries) {
+      final de = _resolverOpcaoNatural(origem, entry.value);
+      final para = _resolverOpcaoNatural(destino, entry.value);
+      if (de == null || para == null) continue;
+      final encontrados = <int>[];
+      for (var i = 0; i < itens.length; i++) {
+        final chave =
+            entry.key == 'mistura' ? 'misturaNome' : 'acompanhamentoNome';
+        if (_normalizar(itens[i][chave]?.toString() ?? '') ==
+            _normalizar(de['nome'].toString())) encontrados.add(i);
+      }
+      if (encontrados.length == 1) {
+        return {
+          'indice': encontrados.single + 1,
+          entry.key: para['nome'],
+          'substituirCampo': entry.key,
+          'substituirIndice': 0,
+        };
+      }
+    }
+    return null;
   }
 
   bool _rascunhoItemCompleto(
@@ -2252,8 +2630,9 @@ class BotService {
 
   List<Map<String, dynamic>>? _capturarTamanhosPedido(
     String entrada,
-    Map<String, dynamic>? sessao,
-  ) {
+    Map<String, dynamic>? sessao, {
+    bool permitirTamanhoSemQuantidade = false,
+  }) {
     final texto = _normalizarIntencao(entrada);
     final padrao = RegExp(
       r'\b(?:(\d{1,2}|um|uma|dois|duas|tres|quatro|cinco|seis|sete|oito|nove|dez)\s+(?:marmitas?\s+)?)?(pequena|media|grande|p|m|g)s?\b',
@@ -2270,12 +2649,6 @@ class BotService {
     final totalAnterior = rascunho['quantidadeTotalSolicitada'] is num
         ? (rascunho['quantidadeTotalSolicitada'] as num).toInt()
         : null;
-    if (ocorrencias.length == 1 &&
-        ocorrencias.single.group(1) == null &&
-        (totalAnterior == null || totalAnterior < 1)) {
-      return null;
-    }
-
     final cardapio = banco.obterCardapio();
     final arrozAtivo = cardapio['fluxoArrozAtivo'] == true;
     final feijaoAtivo = cardapio['fluxoFeijaoAtivo'] == true;
@@ -2301,40 +2674,51 @@ class BotService {
       if (!avaliacao.$1) return null;
       detalhes = avaliacao.$2;
     }
+    if (ocorrencias.length == 1 &&
+        ocorrencias.single.group(1) == null &&
+        (totalAnterior == null || totalAnterior < 1) &&
+        !permitirTamanhoSemQuantidade &&
+        detalhes == null) {
+      return null;
+    }
 
     final opcoes = _itensAtivos(cardapio, 'tamanhos');
     final resultado = <Map<String, dynamic>>[];
+    final quantidadeJaRepresentada =
+        itensExistentes.take(deslocamento).fold<int>(0, (total, item) {
+      final quantidade = item['quantidade'];
+      return total +
+          (quantidade is num && quantidade >= 1 ? quantidade.toInt() : 1);
+    });
+    final quantidadeRestante =
+        totalAnterior == null ? null : totalAnterior - quantidadeJaRepresentada;
     var quantidadeAcumulada = 0;
-    for (var i = 0; i < ocorrencias.length; i++) {
-      final ocorrencia = ocorrencias[i];
+    for (final ocorrencia in ocorrencias) {
       final tamanho = _resolverTamanhoOpcaoNatural(
         ocorrencia.group(2)!,
         opcoes,
       );
       if (tamanho == null) return null;
       final textoQuantidade = ocorrencia.group(1);
-      final quantidade = textoQuantidade == null
-          ? ocorrencias.length == 1
-              ? totalAnterior
-              : null
-          : _parseQuantidade(textoQuantidade);
+      final quantidade =
+          textoQuantidade == null ? 1 : _parseQuantidade(textoQuantidade);
       if (quantidade != null && (quantidade < 1 || quantidade > 50)) {
         return null;
       }
-      if (quantidade != null) quantidadeAcumulada += quantidade;
-      resultado.add({
-        'indice': deslocamento + i + 1,
-        'tamanho': tamanho['nome'],
-        if (quantidade != null) 'quantidade': quantidade,
-        if (detalhes != null) ...detalhes,
-      });
+      quantidadeAcumulada += quantidade ?? 0;
+      for (var unidade = 0; unidade < (quantidade ?? 0); unidade++) {
+        resultado.add({
+          'indice': deslocamento + resultado.length + 1,
+          'tamanho': tamanho['nome'],
+          'quantidade': 1,
+          if (detalhes != null) ...detalhes,
+        });
+      }
     }
-    if (totalAnterior != null &&
-        totalAnterior > 0 &&
-        quantidadeAcumulada > 0 &&
-        quantidadeAcumulada != totalAnterior) {
+    if (quantidadeRestante != null &&
+        (quantidadeRestante < 0 || quantidadeAcumulada > quantidadeRestante)) {
       // Explicit size counts that disagree with the stated total need a
-      // clarification; don't replace the user's earlier quantity plan.
+      // clarification; don't add extra units or replace the earlier plan.
       return null;
     }
     return resultado;
@@ -2653,6 +3037,8 @@ class BotService {
     MensagemWhatsApp msg, {
     String? respostaIA,
     Map<String, dynamic>? pedidoIA,
+    String? horarioRetiradaPedidoAtivo,
+    bool editarPedidoRecente = false,
   }) async {
     if (!banco.iniciarProcessamentoMensagem(msg.id)) return;
     try {
@@ -2667,6 +3053,27 @@ class BotService {
 
       var sessao = banco.obterSessao(msg.telefone);
       if (sessao?['modoHumano'] == true) {
+        banco.finalizarMensagem(msg.id);
+        return;
+      }
+      if (horarioRetiradaPedidoAtivo != null) {
+        final pedidoAtualizado = banco.atualizarHorarioRetiradaPedidoAtivo(
+          msg.telefone,
+          horarioRetiradaPedidoAtivo,
+        );
+        if (pedidoAtualizado != null) {
+          await whatsapp.enviarTexto(
+            msg.telefone,
+            'Prontinho! Atualizei o pedido #${pedidoAtualizado['numero']} '
+            'com a informação de que você vai buscar às '
+            '$horarioRetiradaPedidoAtivo. 😊',
+          );
+        }
+        banco.finalizarMensagem(msg.id);
+        return;
+      }
+      if (editarPedidoRecente) {
+        await _editarPedidoRecenteEnviado(msg);
         banco.finalizarMensagem(msg.id);
         return;
       }
@@ -2955,7 +3362,7 @@ class BotService {
             boasVindasEnviada: true,
           );
         }
-        await _mostrarCardapio(msg, config, incluirBotoes: false);
+        await _mostrarCardapioIaUmaVez(msg, config);
         banco.finalizarMensagem(msg.id);
         return;
       }
@@ -3093,7 +3500,7 @@ class BotService {
             dados: dadosSessao,
           );
         }
-        await _mostrarCardapio(msg, config, incluirBotoes: false);
+        await _mostrarCardapioIaUmaVez(msg, config);
         banco.finalizarMensagem(msg.id);
         return;
       }
@@ -3123,7 +3530,11 @@ class BotService {
         }
         // O caminho de IA retorna acima e envia apenas texto. Aqui preservamos
         // os botões do modo Bot após uma solicitação textual do cardápio.
-        await _mostrarCardapio(msg, config);
+        if (_modoIaAtivo) {
+          await _mostrarCardapioIaUmaVez(msg, config);
+        } else {
+          await _mostrarCardapio(msg, config);
+        }
         banco.finalizarMensagem(msg.id);
         return;
       }
@@ -3300,6 +3711,10 @@ class BotService {
     bool boasVindasNaProximaMensagem = false,
     bool boasVindasEnviada = false,
   }) {
+    final sessaoAnterior = banco.obterSessao(telefone);
+    final cardapioEnviado =
+        (sessaoAnterior?['dados'] as Map?)?['cardapioEnviadoNaConversa'] ==
+            true;
     banco.salvarSessao(
       telefone: telefone,
       nome: nome,
@@ -3307,6 +3722,7 @@ class BotService {
       dados: {
         'clienteNome': nome,
         'itens': <dynamic>[],
+        if (cardapioEnviado) 'cardapioEnviadoNaConversa': true,
         if (boasVindasEnviada) 'boasVindasEnviada': true,
         if (boasVindasNaProximaMensagem) 'aguardaBoasVindas': true,
       },
@@ -3867,8 +4283,11 @@ class BotService {
 
   bool _ehDesistenciaExplicita(String entrada) {
     final norm = _normalizar(entrada);
-    return RegExp(
-          r'^(?:(?:eu\s+|por favor\s+)?(?:deixa\s+qu[ei]eto|deixa\s+pra\s*l[aã]|n[aã]o\s+vou\s+(?:pedir|querer)(?:\s+mais)?|desist[io](?:mos)?|cancela\s+tudo|esquece(?:r)?|nao\s+quero\s+(?:pedir|querer)|nao\s+vou\s+(?:pedir|querer)|desist[io]\s+do\s+pedido|cancela\s+(?:meu\s+)?pedido|para\s+(?:tudo|com\s+isso)|encerra\s+(?:meu\s+)?pedido|quero\s+encerrar|quero\s+parar|nao\s+quero\s+mais\s+nada|nao\s+quero\s+continuar|quero\s+cancelar\s+(?:meu\s+)?pedido|cancela\s+tudo|esquece(?:r)?)(?:\s+(?:obg|obrigado|obrigada|valeu|pfv|por\s+favor))?)$',
+    // Pedidos formulados como cancelamento devem passar pela confirmação própria.
+    if (RegExp(r'\b(?:cancelar|cancela|cancele|encerrar|encerra)\b')
+        .hasMatch(norm)) return false;
+    final result = RegExp(
+          r'^(?:(?:eu\s+|por favor\s+)?(?:deixa\s+qu[ei]eto|deixa\s+pra\s*l[aã]|n[aã]o\s+vou\s+(?:pedir|querer)(?:\s+mais)?|desist[io](?:mos)?|cancela\s+tudo|esquece(?:r)?|nao\s+quero\s+(?:pedir|querer)|nao\s+vou\s+(?:pedir|querer)|desist[io]\s+do\s+pedido|para\s+(?:tudo|com\s+isso)|quero\s+encerrar|quero\s+parar|nao\s+quero\s+mais\s+nada|nao\s+quero\s+continuar|cancela\s+tudo|esquece(?:r)?)(?:\s+(?:obg|obrigado|obrigada|valeu|pfv|por\s+favor))?)$',
         ).hasMatch(norm) ||
         _correspondeIntencao(entrada, [
           'deixa quieto',
@@ -3885,7 +4304,6 @@ class BotService {
           'nao quero pedir',
           'nao quero querer',
           'desisto do pedido',
-          'cancela meu pedido',
           'para tudo',
           'para com isso',
           'encerra meu pedido',
@@ -3893,7 +4311,6 @@ class BotService {
           'quero parar',
           'nao quero mais nada',
           'nao quero continuar',
-          'quero cancelar meu pedido',
           'cancela tudo',
           'esquece',
           'deixa quieto obg',
@@ -3933,6 +4350,7 @@ class BotService {
           'esquece obrigada',
           'esquece valeu',
         ]);
+    return result;
   }
 
   bool _ehNegacaoPedido(String entrada) => _corresponde(entrada, [
@@ -4009,6 +4427,24 @@ class BotService {
     final etapa = sessao['etapa']?.toString() ?? 'inicio';
     final dados = Map<String, dynamic>.from(sessao['dados'] as Map? ?? {});
     final entrada = _normalizar(msg.entrada);
+
+    final horarioRetirada = _horarioRetiradaMencionado(msg.entrada);
+    if (horarioRetirada != null &&
+        !{'recebimento', 'endereco'}.contains(etapa)) {
+      _aplicarHorarioRetirada(config, dados, horarioRetirada);
+      banco.salvarSessao(
+        telefone: msg.telefone,
+        nome: msg.nome,
+        etapa: etapa,
+        dados: dados,
+      );
+      await whatsapp.enviarTexto(
+        msg.telefone,
+        'Combinado! Anotei no pedido que você pretende buscar às '
+        '$horarioRetirada.${_mensagemEhSoHorarioRetirada(msg.entrada) ? ' Pode continuar de onde paramos 😊' : ''}',
+      );
+      if (_mensagemEhSoHorarioRetirada(msg.entrada)) return;
+    }
 
     if (etapa == 'inicio' && dados.remove('aguardaBoasVindas') == true) {
       // Não reinicie nem descarte a mensagem que motivou a retomada.
@@ -4143,12 +4579,15 @@ class BotService {
       'pedido',
       _textoFluxo('inicio', 'botaoPedido', 'Fazer pedido')
     ])) {
+      final cardapioJaEnviado = dados['cardapioEnviadoNaConversa'] == true;
       dados
         ..clear()
         ..addAll({
           'clienteNome': msg.nome,
           'itens': <dynamic>[],
           if (_modoIaAtivo) 'boasVindasEnviada': true,
+          if (_modoIaAtivo && cardapioJaEnviado)
+            'cardapioEnviadoNaConversa': true,
         });
       if (_modoIaAtivo) {
         await _processarPedidoIA(
@@ -4169,7 +4608,11 @@ class BotService {
       'cardapio',
       _textoFluxo('inicio', 'botaoCardapio', 'Ver cardápio')
     ])) {
-      await _mostrarCardapio(msg, config);
+      if (_modoIaAtivo) {
+        await _mostrarCardapioIaUmaVez(msg, config);
+      } else {
+        await _mostrarCardapio(msg, config);
+      }
       return;
     }
     if (_corresponde(entrada, [
@@ -4199,7 +4642,41 @@ class BotService {
     );
   }
 
-  Future<void> _mostrarCardapio(
+  Future<void> _mostrarCardapioIaUmaVez(
+    MensagemWhatsApp msg,
+    Map<String, dynamic> config,
+  ) async {
+    final sessao = banco.obterSessao(msg.telefone);
+    final dados = Map<String, dynamic>.from(sessao?['dados'] as Map? ?? {});
+    if (dados['cardapioEnviadoNaConversa'] == true) {
+      await whatsapp.enviarTexto(
+        msg.telefone,
+        'Já enviei o cardápio nesta conversa 😊 Se quiser, posso conferir a disponibilidade ou o preço de um item específico. Qual você quer consultar?',
+      );
+      return;
+    }
+
+    final enviado = await _mostrarCardapio(
+      msg,
+      config,
+      incluirBotoes: false,
+    );
+    if (!enviado) return;
+
+    final sessaoAtualizada = banco.obterSessao(msg.telefone);
+    final dadosAtualizados =
+        Map<String, dynamic>.from(sessaoAtualizada?['dados'] as Map? ?? {});
+    dadosAtualizados['cardapioEnviadoNaConversa'] = true;
+    banco.salvarSessao(
+      telefone: msg.telefone,
+      nome: sessaoAtualizada?['nome']?.toString() ?? msg.nome,
+      etapa: sessaoAtualizada?['etapa']?.toString() ?? 'inicio',
+      dados: dadosAtualizados,
+      modoHumano: sessaoAtualizada?['modoHumano'] == true,
+    );
+  }
+
+  Future<bool> _mostrarCardapio(
       MensagemWhatsApp msg, Map<String, dynamic> config,
       {bool incluirBotoes = true}) async {
     final c = banco.obterCardapio();
@@ -4229,7 +4706,7 @@ class BotService {
         msg,
         'O cardápio está temporariamente indisponível. Fale com um atendente.',
       );
-      return;
+      return false;
     }
 
     if (c['modoExibicao'] == 'imagem') {
@@ -4252,7 +4729,7 @@ class BotService {
             },
           ]);
         }
-        return;
+        return true;
       }
     }
 
@@ -4309,7 +4786,7 @@ class BotService {
     final texto = linhas.join('\n');
     if (!incluirBotoes || _modoIaAtivo) {
       await whatsapp.enviarTexto(msg.telefone, texto);
-      return;
+      return true;
     }
     await _enviarBotoes(msg.telefone, texto, [
       {
@@ -4321,6 +4798,7 @@ class BotService {
         'titulo': _textoFluxo('inicio', 'botaoHumano', 'Falar atendente')
       },
     ]);
+    return true;
   }
 
   Future<void> _mostrarTamanhos(
@@ -4884,6 +5362,12 @@ class BotService {
       );
       return;
     }
+    if (dados['preferenciaRecebimento'] == 'retirada' &&
+        opcoes.any((opcao) => opcao['id'] == 'rec_retirada')) {
+      dados.remove('preferenciaRecebimento');
+      await _tratarRecebimento(msg, config, dados, 'rec_retirada');
+      return;
+    }
     dados['recebimentosExibidos'] = opcoes;
     if (permitirPulo &&
         opcoes.length == 1 &&
@@ -4911,6 +5395,10 @@ class BotService {
     Map<String, dynamic> dados,
     String entrada,
   ) async {
+    final horarioRetirada = _resolverFormaRecebimento(entrada) == 'rec_retirada'
+        ? _extrairHorarioDaMensagem(entrada)
+        : null;
+    if (horarioRetirada != null) dados['horarioRetirada'] = horarioRetirada;
     final atuais = _opcoesRecebimento(config);
     final opcoes = (dados['recebimentosExibidos'] as List? ?? atuais)
         .map((e) => Map<String, String>.from(e as Map))
@@ -4962,6 +5450,7 @@ class BotService {
     dados['endereco'] = enderecoRetirada;
     await whatsapp.enviarTexto(
       msg.telefone,
+      '${horarioRetirada == null ? '' : 'Combinado! Você pretende buscar às $horarioRetirada.\n'}'
       '🏠 *Retirada em:*\n$enderecoRetirada',
     );
     await _mostrarPagamentos(msg, config, dados);
@@ -4984,6 +5473,7 @@ class BotService {
     dados.remove('taxaEntregaCongelada');
     dados.remove('cidadeConfirmadaCliente');
     dados.remove('ultimaLocalizacao');
+    dados.remove('preferenciaRecebimento');
   }
 
   Future<void> _pedirEndereco(
@@ -5023,6 +5513,8 @@ class BotService {
     dados.remove('ultimaLocalizacao');
 
     if (_ehIntencaoRetirada(endereco)) {
+      final horarioRetirada = _extrairHorarioDaMensagem(endereco);
+      if (horarioRetirada != null) dados['horarioRetirada'] = horarioRetirada;
       final enderecoRetirada =
           config['enderecoRetirada']?.toString().trim() ?? '';
       if (enderecoRetirada.isEmpty) {
@@ -5038,6 +5530,7 @@ class BotService {
       dados['endereco'] = enderecoRetirada;
       await whatsapp.enviarTexto(
         msg.telefone,
+        '${horarioRetirada == null ? '' : 'Combinado! Você pretende buscar às $horarioRetirada.\n'}'
         '🏠 *Retirada em:*\n$enderecoRetirada',
       );
       await _mostrarPagamentos(msg, config, dados);
@@ -7429,6 +7922,9 @@ class BotService {
     Map<String, dynamic> dados,
   ) async {
     final calculo = _calcular(dados, config);
+    final sessaoAnterior = banco.obterSessao(msg.telefone);
+    final enviarAutomaticamente =
+        _modoIaAtivo && sessaoAnterior?['etapa'] != 'confirmacao';
     banco.salvarSessao(
       telefone: msg.telefone,
       nome: msg.nome,
@@ -7491,6 +7987,10 @@ class BotService {
           config['enderecoRetirada']?.toString().trim() ??
           '';
       if (enderecoRetirada.isNotEmpty) linhas.add('📍 $enderecoRetirada');
+      final horarioRetirada = dados['horarioRetirada']?.toString().trim() ?? '';
+      if (horarioRetirada.isNotEmpty) {
+        linhas.add('🕒 Retirada prevista: $horarioRetirada');
+      }
     }
 
     linhas.add('💳 ${_pagamentoNome(dados['pagamento']?.toString() ?? '')}');
@@ -7510,7 +8010,11 @@ class BotService {
       linhas.add('Taxa da maquininha: ${moeda(calculo.taxaMaquininha)}');
     }
     linhas.add('*TOTAL: ${moeda(calculo.total)}*');
-    if (_modoIaAtivo) linhas.add('\nFicou tudo certo?');
+    if (enviarAutomaticamente) {
+      await whatsapp.enviarTexto(msg.telefone, linhas.join('\n'));
+      await _tratarConfirmacao(msg, config, dados, 'conf_confirmar');
+      return;
+    }
 
     await _enviarBotoes(
       msg.telefone,
@@ -7775,6 +8279,7 @@ class BotService {
       cidadeEntrega: dados['cidadeEntrega']?.toString(),
       ufEntrega: dados['ufEntrega']?.toString(),
       enderecoValidado: dados['enderecoValidado'] == true,
+      horarioRetirada: dados['horarioRetirada']?.toString(),
       pagamento: pagamento,
       trocoPara: (dados['trocoPara'] as num?)?.toDouble(),
       observacao: dados['observacao']?.toString(),
@@ -8269,6 +8774,89 @@ class BotService {
     return entrega ? 'rec_entrega' : 'rec_retirada';
   }
 
+  String? _extrairHorarioDaMensagem(String entrada) {
+    if (RegExp(r'\bmeio[- ]?dia\b', caseSensitive: false).hasMatch(entrada)) {
+      return '12h';
+    }
+    final match = RegExp(
+      r'\b([01]?\d|2[0-3])\s*(?::|h)(\d{2})?\b',
+      caseSensitive: false,
+    ).firstMatch(entrada);
+    final matchHoraFalando = match ??
+        RegExp(r'\b(?:as|a)\s*([01]?\d|2[0-3])\b', caseSensitive: false)
+            .firstMatch(_normalizar(entrada));
+    if (matchHoraFalando == null) {
+      final matchHoras = RegExp(
+        r'\b([01]?\d|2[0-3])\s*horas?\b',
+        caseSensitive: false,
+      ).firstMatch(_normalizar(entrada));
+      if (matchHoras == null) return null;
+      final hora = int.tryParse(matchHoras.group(1) ?? '');
+      return hora == null ? null : '${hora}h';
+    }
+    final hora = int.tryParse(matchHoraFalando.group(1) ?? '');
+    final minuto = int.tryParse(matchHoraFalando.group(2) ?? '0');
+    if (hora == null || minuto == null || minuto > 59) return null;
+    return minuto == 0
+        ? '${hora}h'
+        : '${hora}h${minuto.toString().padLeft(2, '0')}';
+  }
+
+  String? _horarioRetiradaMencionado(String entrada) =>
+      _resolverFormaRecebimento(entrada) == 'rec_retirada'
+          ? _extrairHorarioDaMensagem(entrada)
+          : null;
+
+  void _aplicarHorarioRetirada(
+    Map<String, dynamic> config,
+    Map<String, dynamic> dados,
+    String horario,
+  ) {
+    dados['horarioRetirada'] = horario;
+    dados['preferenciaRecebimento'] = 'retirada';
+    dados['recebimento'] = 'retirada';
+    dados['taxaEntregaCongelada'] = 0.0;
+    final endereco = config['enderecoRetirada']?.toString().trim() ?? '';
+    if (endereco.isNotEmpty) dados['endereco'] = endereco;
+    for (final campo in const [
+      'endereco',
+      'enderecoPendente',
+      'cepEntrega',
+      'cidadeEntrega',
+      'cidadeEntregaId',
+      'ufEntrega',
+      'logradouroValidado',
+      'bairroValidado',
+      'cidadeConfirmadaCliente',
+      'enderecoValidado',
+    ]) {
+      dados.remove(campo);
+    }
+  }
+
+  bool _mensagemIniciaNovoPedido(String entrada) {
+    final texto = _normalizarIntencao(entrada);
+    final intencao = RegExp(
+      r'\b(?:quero|queria|gostaria de|vou pedir|fazer(?: um)? pedido|pedir)\b',
+    ).hasMatch(texto);
+    return intencao &&
+        RegExp(r'\b(?:marmita|marmitas|pedido|pedidos)\b').hasMatch(texto);
+  }
+
+  bool _mensagemEhSoHorarioRetirada(String entrada) {
+    var restante = _normalizarIntencao(entrada);
+    restante = restante
+        .replaceAll(
+          RegExp(
+              r'\b(?:eu|irei|vou|passo|pretendo|buscar|retirar|pegar|as|por volta de|meio dia)\b'),
+          ' ',
+        )
+        .replaceAll(RegExp(r'\b\d{1,2}\s*(?::|h)\s*\d{0,2}\b'), ' ')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    return restante.isEmpty;
+  }
+
   bool _ehIntencaoRetirada(String entrada) =>
       _resolverFormaRecebimento(entrada) == 'rec_retirada';
 
@@ -8302,21 +8890,42 @@ class BotService {
     return credito && debito;
   }
 
-  bool _ehComandoCancelar(String entrada) => _correspondeIntencao(entrada, [
-        if (!_modoIaAtivo) '0',
-        'cancelar',
-        'cancela',
-        'cancelar pedido',
-        'cancela pedido',
-        'cancelar meu pedido',
-        'cancela meu pedido',
-        'quero cancelar',
-        'pode cancelar',
-        'desistir do pedido',
-        'desisti do pedido',
-        'nao quero mais',
-        'conf_cancelar',
-      ]);
+  bool _ehComandoCancelar(String entrada) {
+    final texto = _normalizarIntencao(entrada);
+    if (_contemTermo(texto, ['nao', 'nunca', 'sem'])) return false;
+    return _correspondeIntencao(entrada, [
+          if (!_modoIaAtivo) '0',
+          'cancelar',
+          'cancela',
+          'cancelar pedido',
+          'cancela pedido',
+          'cancelar meu pedido',
+          'cancela meu pedido',
+          'quero cancelar',
+          'quero cancelar tudo',
+          'pode cancelar',
+          'pode cancelar pra mim',
+          'pode cancelar para mim',
+          'cancela pra mim',
+          'cancela para mim',
+          'desistir do pedido',
+          'desisti do pedido',
+          'quero desistir',
+          'quero desistir do pedido',
+          'prefiro desistir do pedido',
+          'nao quero mais',
+          'nao quero continuar',
+          'quero parar o pedido',
+          'pode parar o pedido',
+          'quero parar com esse pedido',
+          'quero parar com o pedido',
+          'nao quero seguir com o pedido',
+          'conf_cancelar',
+        ]) ||
+        RegExp(
+          r'\b(?:quero|queria|gostaria de|pode|por favor)?\s*(?:cancelar|cancela|cancele|desistir|encerrar|encerra|parar)\s+(?:(?:o|esse|este|meu|meu atual)\s+)?(?:pedido|pedido atual|isso|tudo)\b',
+        ).hasMatch(texto);
+  }
 
   bool _ehComandoHumano(String entrada) {
     if (_correspondeIntencao(entrada, [
@@ -8334,6 +8943,20 @@ class BotService {
       'quero falar com alguem',
       'preciso de um atendente',
       'preciso de ajuda humana',
+      'quero falar com uma pessoa',
+      'quero falar com uma pessoa real',
+      'quero falar com um humano',
+      'quero falar com alguém',
+      'quero conversar com uma pessoa',
+      'quero conversar com alguém',
+      'preciso falar com uma pessoa',
+      'preciso falar com alguém',
+      'me transfere para um atendente',
+      'me transfere pro atendente',
+      'me passa para um atendente',
+      'me passa pro atendente',
+      'encaminha para um atendente',
+      'quero atendimento de uma pessoa',
     ])) {
       return true;
     }
@@ -8352,6 +8975,12 @@ class BotService {
           'gostaria',
           'preciso',
           'atendimento',
+          'transferir',
+          'transfere',
+          'encaminhar',
+          'encaminha',
+          'passar',
+          'passa',
         ]);
   }
 
@@ -8364,6 +8993,17 @@ class BotService {
         'cmd_voltar',
         'quero voltar',
         'pode voltar',
+        'volta pra etapa anterior',
+        'volta para a etapa anterior',
+        'voltar um passo',
+        'volta um passo',
+        'retornar',
+        'retorna',
+        'voltar para trás',
+        'retornar uma etapa',
+        'quero retornar',
+        'voltar atras',
+        'volta atras',
         'voltar etapa',
         'voltar uma etapa',
         'etapa anterior',
@@ -8373,16 +9013,37 @@ class BotService {
         'digitei errado',
       ]);
 
-  bool _ehComandoAjuda(String entrada) => _correspondeIntencao(entrada, [
-        'ajuda',
-        'help',
-        'me ajuda',
-        'preciso de ajuda',
-        'nao entendi',
-        'o que eu faco',
-        'o que faco',
-        'como funciona',
-      ]);
+  bool _ehComandoAjuda(String entrada) {
+    if (_correspondeIntencao(entrada, [
+      'ajuda',
+      'help',
+      'me ajuda',
+      'me ajuda por favor',
+      'pode me ajudar',
+      'poderia me ajudar',
+      'preciso de ajuda',
+      'me explica',
+      'pode me explicar',
+      'como eu faço',
+      'o que devo fazer',
+      'me orienta',
+      'me dá uma ajuda',
+      'me da uma ajuda',
+      'estou perdido',
+      'estou perdida',
+      'não sei como continuar',
+      'nao sei como continuar',
+      'nao entendi',
+      'não entendi',
+      'o que eu faco',
+      'o que faco',
+      'como funciona',
+    ])) return true;
+    final texto = _normalizarIntencao(entrada);
+    return RegExp(
+      r'^(?:(?:voce pode|pode|poderia|consegue|conseguiria)?\s*(?:me )?(?:ajudar|explicar|orientar)|(?:me )?da uma ajuda|ajuda)(?: por favor| ai)?$',
+    ).hasMatch(texto);
+  }
 
   bool _ehConsultaStatusPedido(String entrada) {
     final texto = _normalizarIntencao(entrada);
@@ -8471,7 +9132,7 @@ class BotService {
     final cardapio = banco.obterCardapio();
     if (itens.isEmpty) {
       return (total ?? 0) > 1
-          ? 'Quais tamanhos você prefere para as $total marmitas?'
+          ? 'Vamos começar pela primeira marmita: qual tamanho, mistura e acompanhamento você prefere?'
           : 'O que você gostaria de pedir?';
     }
     for (var i = 0; i < itens.length; i++) {
@@ -8479,8 +9140,19 @@ class BotService {
       final umaSo = itens.length == 1;
       final referencia = _referenciaMarmitaIa(itens, i, totalSolicitado: total);
       if (item['tamanho'] == null) {
+        final jaTemOutrosDetalhes = item['mistura'] != null ||
+            item['acompanhamento'] != null ||
+            item['arroz'] != null ||
+            item['feijao'] != null ||
+            (item['misturas'] is List &&
+                (item['misturas'] as List).isNotEmpty) ||
+            (item['acompanhamentos'] is List &&
+                (item['acompanhamentos'] as List).isNotEmpty);
+        if (jaTemOutrosDetalhes) {
+          return 'Qual tamanho você prefere $referencia?';
+        }
         return umaSo && (total ?? 0) > 1
-            ? 'Quais tamanhos você prefere para as $total marmitas?'
+            ? 'Vamos começar pela primeira marmita: qual tamanho, mistura e acompanhamento você prefere?'
             : umaSo
                 ? 'Qual tamanho você prefere para sua marmita?'
                 : 'Qual tamanho você prefere para a próxima marmita?';
@@ -8521,7 +9193,12 @@ class BotService {
     });
     final temMultiplas = totalRepresentado > 1 || (totalSolicitado ?? 0) > 1;
     if (!temMultiplas) return 'na sua marmita';
-    return 'nessa combinação';
+    final repetida = itens.take(indice).any((anterior) =>
+        _normalizar(anterior['tamanho']?.toString() ?? '') ==
+        _normalizar(tamanho));
+    return repetida
+        ? 'para a próxima marmita ${tamanho.toLowerCase()}'
+        : 'para sua marmita ${tamanho.toLowerCase()}';
   }
 
   bool _ehComandoCorrigir(String entrada) => _correspondeIntencao(entrada, [

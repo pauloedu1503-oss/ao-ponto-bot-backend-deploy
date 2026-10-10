@@ -89,6 +89,23 @@ class PushService {
       }
     }
 
+    for (final row in banco.db.select('''
+      SELECT id, tipo, titulo, corpo, ultimo_envio_em
+      FROM push_eventos WHERE status = 'pendente'
+    ''')) {
+      final ultimo =
+          DateTime.tryParse(row['ultimo_envio_em']?.toString() ?? '');
+      if (ultimo == null || agora.difference(ultimo).inSeconds >= 60) {
+        alertas.add({
+          'tipo': row['tipo'],
+          'referencia': row['id'].toString(),
+          'titulo': row['titulo'],
+          'corpo': row['corpo'],
+          'duracao': '0',
+        });
+      }
+    }
+
     if (alertas.isEmpty) return;
     _enviando = true;
     try {
@@ -148,6 +165,17 @@ class PushService {
             enviado ? agoraIso() : null,
             erro,
             int.parse(alerta['referencia'])
+          ]);
+        } else if (alerta['tipo'] == 'atualizacao_pedido') {
+          banco.db.execute('''
+            UPDATE push_eventos
+            SET status=?, ultimo_envio_em=?, tentativas=tentativas+1, erro=?
+            WHERE id=?
+          ''', [
+            enviado ? 'enviado' : 'pendente',
+            enviado ? agoraIso() : agoraIso(),
+            erro,
+            int.parse(alerta['referencia']),
           ]);
         } else {
           banco.db.execute('''

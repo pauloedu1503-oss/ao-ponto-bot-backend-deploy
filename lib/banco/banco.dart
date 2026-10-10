@@ -175,6 +175,7 @@ class Banco {
     _adicionarColunaSeAusente('pedidos', 'uf_entrega', 'TEXT');
     _adicionarColunaSeAusente(
         'pedidos', 'endereco_validado', 'INTEGER NOT NULL DEFAULT 0');
+    _adicionarColunaSeAusente('pedidos', 'horario_retirada', 'TEXT');
 
     db.execute(
         'CREATE INDEX IF NOT EXISTS idx_pedidos_status ON pedidos(status);');
@@ -243,6 +244,22 @@ class Banco {
       );
     ''');
     _adicionarColunaSeAusente('push_saida', 'ultimo_envio_em', 'TEXT');
+
+    db.execute('''
+      CREATE TABLE IF NOT EXISTS push_eventos (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        pedido_id INTEGER NOT NULL,
+        tipo TEXT NOT NULL,
+        titulo TEXT NOT NULL,
+        corpo TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pendente',
+        tentativas INTEGER NOT NULL DEFAULT 0,
+        criado_em TEXT NOT NULL,
+        ultimo_envio_em TEXT,
+        erro TEXT,
+        FOREIGN KEY (pedido_id) REFERENCES pedidos(id)
+      );
+    ''');
 
     db.execute('''
       CREATE TABLE IF NOT EXISTS push_humano (
@@ -1087,6 +1104,7 @@ class Banco {
     String? cidadeEntrega,
     String? ufEntrega,
     bool enderecoValidado = false,
+    String? horarioRetirada,
     required String pagamento,
     double? trocoPara,
     String? observacao,
@@ -1129,11 +1147,11 @@ class Banco {
     db.execute('''
       INSERT INTO pedidos (
         telefone, cliente_nome, status, recebimento, endereco, cep_entrega,
-        cidade_entrega, uf_entrega, endereco_validado, pagamento,
+        cidade_entrega, uf_entrega, endereco_validado, horario_retirada, pagamento,
         troco_para, observacao, subtotal, taxa_entrega, taxa_maquininha,
         total, itens_json, bebidas_json,
         versao, criado_em, atualizado_em
-      ) VALUES (?, ?, 'novo', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+      ) VALUES (?, ?, 'novo', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
     ''', [
       telefone,
       clienteNome,
@@ -1143,6 +1161,7 @@ class Banco {
       cidadeEntrega,
       ufEntrega,
       enderecoValidado ? 1 : 0,
+      horarioRetirada,
       pagamento,
       trocoPara,
       observacao,
@@ -1188,6 +1207,104 @@ class Banco {
     final rows = db.select('SELECT * FROM pedidos WHERE id = ?', [id]);
     if (rows.isEmpty) return null;
     return _pedidoMap(rows.first);
+  }
+
+  bool temPedidoAtivo(String telefone) => db.select('''
+        SELECT 1 FROM pedidos
+        WHERE telefone = ? AND status IN ('novo', 'confirmado', 'pronto')
+        LIMIT 1
+      ''', [telefone]).isNotEmpty;
+
+  Map<String, dynamic>? atualizarHorarioRetiradaPedidoAtivo(
+    String telefone,
+    String horario,
+  ) {
+    final pedidos = db.select('''
+      SELECT id FROM pedidos
+      WHERE telefone = ? AND status IN ('novo', 'confirmado', 'pronto')
+      ORDER BY id DESC LIMIT 1
+    ''', [telefone]);
+    if (pedidos.isEmpty) return null;
+    final id = pedidos.first['id'];
+    db.execute('''
+      UPDATE pedidos SET horario_retirada = ?, versao = versao + 1,
+        atualizado_em = ?
+      WHERE id = ? AND status IN ('novo', 'confirmado', 'pronto')
+    ''', [horario, agoraIso(), id]);
+    if (db.updatedRows != 1) return null;
+    final pedido = obterPedido((id as num).toInt());
+    if (pedido == null) return null;
+    db.execute('''
+      INSERT INTO push_eventos(
+        pedido_id, tipo, titulo, corpo, status, tentativas, criado_em
+      ) VALUES (?, 'atualizacao_pedido', ?, ?, 'pendente', 0, ?)
+    ''', [
+      id,
+      'Atualização do pedido #${pedido['numero']}',
+      'Cliente informou retirada às $horario.',
+      agoraIso(),
+    ]);
+    log('INFO', 'horario_retirada_pedido_atualizado', '#$id $horario');
+    return pedido;
+  }
+
+  Map<String, dynamic>? pedidoRecenteEditavel(String telefone,
+      {Duration janela = const Duration(minutes: 5)}) {
+    final rows = db.select('''
+      SELECT id, criado_em FROM pedidos
+      WHERE telefone = ? AND status != 'cancelado'
+      ORDER BY id DESC LIMIT 1
+    ''', [telefone]);
+    if (rows.isEmpty) return null;
+    final criadoEm = DateTime.tryParse(rows.first['criado_em'].toString());
+    if (criadoEm == null ||
+        agoraLocal().difference(criadoEm) > janela ||
+        agoraLocal().isBefore(criadoEm)) return null;
+    return obterPedido((rows.first['id'] as num).toInt());
+  }
+
+  Map<String, dynamic>? pedidoAguardandoPreparo(String telefone) {
+    final rows = db.select('''
+      SELECT id FROM pedidos
+      WHERE telefone = ? AND status != 'cancelado'
+      ORDER BY id DESC LIMIT 1
+    ''', [telefone]);
+    if (rows.isEmpty) return null;
+    return obterPedido((rows.first['id'] as num).toInt());
+  }
+
+  Map<String, dynamic>? atualizarDetalhesPedidoRecente({
+    required int id,
+    required List<Map<String, dynamic>> itens,
+    required String? observacao,
+    Duration janela = const Duration(minutes: 5),
+  }) {
+    final pedido = obterPedido(id);
+    if (pedido == null || pedido['status'] == 'cancelado') {
+      return null;
+    }
+    final criadoEm = DateTime.tryParse(pedido['criadoEm'].toString());
+    if (criadoEm == null ||
+        agoraLocal().difference(criadoEm) > janela ||
+        agoraLocal().isBefore(criadoEm)) return null;
+    db.execute('''
+      UPDATE pedidos SET itens_json = ?, observacao = ?, versao = versao + 1,
+        atualizado_em = ? WHERE id = ? AND status != 'cancelado'
+    ''', [jsonEncode(itens), observacao, agoraIso(), id]);
+    if (db.updatedRows != 1) return null;
+    final atualizado = obterPedido(id)!;
+    db.execute('''
+      INSERT INTO push_eventos(
+        pedido_id, tipo, titulo, corpo, status, tentativas, criado_em
+      ) VALUES (?, 'atualizacao_pedido', ?, ?, 'pendente', 0, ?)
+    ''', [
+      id,
+      'Atualização do pedido #${atualizado['numero']}',
+      'O cliente atualizou itens ou observações do pedido.',
+      agoraIso(),
+    ]);
+    log('INFO', 'detalhes_pedido_atualizados', '#$id');
+    return atualizado;
   }
 
   List<Map<String, dynamic>> listarPedidos({String? status, int limite = 100}) {
@@ -1269,6 +1386,7 @@ class Banco {
         'cidadeEntrega': r['cidade_entrega'],
         'ufEntrega': r['uf_entrega'],
         'enderecoValidado': (r['endereco_validado'] as int? ?? 0) == 1,
+        'horarioRetirada': r['horario_retirada'],
         'pagamento': r['pagamento'],
         'trocoPara': r['troco_para'],
         'observacao': r['observacao'],
