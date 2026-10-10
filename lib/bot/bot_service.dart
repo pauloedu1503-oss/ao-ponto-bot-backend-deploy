@@ -352,6 +352,43 @@ class BotService {
         },
       );
     }
+    if (etapaAtual == 'inicio') {
+      // Um cliente pode começar direto com tamanhos ou com a combinação
+      // completa. Não dependa da IA para reconhecer estas estruturas claras:
+      // a captura determinística mantém a quantidade e cada escolha ligada à
+      // marmita correta desde a primeira mensagem.
+      final compostas = _capturarOpcoesPedidoCompostas(msg.entrada, sessao);
+      final tamanhos = _capturarTamanhosPedido(
+        msg.entrada,
+        sessao,
+        permitirTamanhoSemQuantidade: compostas != null,
+      );
+      final referenciaEntreItens = RegExp(
+        r'\b(?:outra|outro|cada|primeira|primeiro|segunda|segundo|terceira|terceiro|ambas|ambos)\b|\b(?:nas\s+duas|em\s+ambas|para\s+as\s+duas|pras\s+duas|nos\s+dois|em\s+ambos)\b',
+      ).hasMatch(_normalizarIntencao(msg.entrada));
+      if ((compostas != null || tamanhos != null) && !referenciaEntreItens) {
+        final porIndice = <int, Map<String, dynamic>>{};
+        for (final item in tamanhos ?? const <Map<String, dynamic>>[]) {
+          final indice = (item['indice'] as num?)?.toInt();
+          if (indice != null)
+            porIndice[indice] = Map<String, dynamic>.from(item);
+        }
+        for (final item in compostas ?? const <Map<String, dynamic>>[]) {
+          final indice = (item['indice'] as num?)?.toInt();
+          if (indice != null) {
+            porIndice.putIfAbsent(indice, () => {'indice': indice})
+              ..addAll(item);
+          }
+        }
+        final itens = porIndice.values.toList()
+          ..sort((a, b) => (a['indice'] as int).compareTo(b['indice'] as int));
+        return InterpretacaoAtendimento(
+          'pedido',
+          '',
+          pedido: {'itens': itens, 'finalizarItens': false},
+        );
+      }
+    }
     if (etapaAtual == 'adicionar_outro') {
       final cardapioAtual = banco.obterCardapio();
       final mencionaOpcao = [
@@ -1296,7 +1333,15 @@ class BotService {
               ? rawPlural.map((valor) => valor.toString().trim()).toList()
               : <String>[];
           final rawSingular = raw[escolha.$1];
-          if (rawSingular is String && rawSingular.trim().isNotEmpty) {
+          // Algumas respostas estruturadas da IA incluem a mesma escolha nos
+          // campos singular e plural. Isso representa uma única seleção; já
+          // repetições explícitas dentro da lista plural são preservadas.
+          final singularJaVeioNaLista = rawSingular is String &&
+              recebidas.any((valor) =>
+                  _normalizar(valor) == _normalizar(rawSingular.trim()));
+          if (rawSingular is String &&
+              rawSingular.trim().isNotEmpty &&
+              !singularJaVeioNaLista) {
             recebidas.add(rawSingular.trim());
           }
           if (recebidas.isEmpty) continue;
@@ -1318,9 +1363,15 @@ class BotService {
               novas.add(valor);
             }
           }
-          final unicas = novas.toSet().take(5).toList();
-          destino[escolha.$2] = unicas;
-          destino[escolha.$3] = unicas.isEmpty ? null : unicas.first;
+          // Repetir a mesma mistura é uma escolha válida quando o tamanho
+          // comporta mais de uma. Não deduplicar misturas: cada posição conta
+          // como uma escolha. Acompanhamentos continuam únicos.
+          final valores =
+              (escolha.$2 == 'misturas' ? novas : novas.toSet().toList())
+                  .take(5)
+                  .toList();
+          destino[escolha.$2] = valores;
+          destino[escolha.$3] = valores.isEmpty ? null : valores.first;
         }
         for (final campo in const [
           'tamanho',
@@ -1483,7 +1534,6 @@ class BotService {
 
     final normalizados = <Map<String, dynamic>>[];
     String? perguntaPendente;
-    var indicePerguntaPendente = -1;
     for (var i = 0; i < itens.length; i++) {
       final item = itens[i];
       final tamanho = _resolverOpcaoNatural(
@@ -1523,8 +1573,9 @@ class BotService {
         for (final valor in valores) {
           final resolvida = _resolverOpcaoNatural(valor, opcoes);
           if (resolvida != null &&
-              !resultado
-                  .any((existente) => existente['id'] == resolvida['id'])) {
+              (colecao == 'misturas' ||
+                  !resultado.any(
+                      (existente) => existente['id'] == resolvida['id']))) {
             resultado.add(resolvida);
           }
         }
@@ -1644,16 +1695,15 @@ class BotService {
           i,
           totalSolicitado: rascunho['quantidadeTotalSolicitada'] as num?,
         );
-        final restantes = _itensAtivos(cardapio, 'misturas')
-            .where((opcao) =>
-                !misturas.any((escolhida) => escolhida['id'] == opcao['id']))
-            .toList();
+        // Uma escolha já feita continua disponível: o cliente pode querer
+        // repetir a mistura na segunda posição (por exemplo, duas iguais).
+        final restantes = _itensAtivos(cardapio, 'misturas');
         final tamanhoNome = tamanho['nome']?.toString().trim() ?? '';
         final pergunta = quantidadeMisturas == 1
             ? 'Qual mistura você prefere $referencia?'
             : misturas.length == 1 && tamanhoNome.isNotEmpty
-                ? 'Você pode escolher a segunda mistura para sua marmita $tamanhoNome. Vai querer qual?'
-                : 'Você pode escolher mais uma mistura $referencia. Vai querer qual?';
+                ? 'A marmita $tamanhoNome ainda permite mais uma mistura. Qual você prefere?'
+                : 'Falta escolher mais uma mistura $referencia. Qual você prefere?';
         perguntaPendente = _perguntaOpcaoIA(
           pergunta,
           restantes,
@@ -1692,7 +1742,6 @@ class BotService {
         perguntaPendente = 'Quantas marmitas iguais a essa você gostaria?';
       }
       if (perguntaPendente != null) {
-        indicePerguntaPendente = i;
         break;
       }
       if (tamanho == null ||
@@ -1751,13 +1800,6 @@ class BotService {
     _atualizarPendenciasValidacaoRascunho(itens, cardapio);
 
     if (perguntaPendente != null) {
-      perguntaPendente = _contextualizarProximaMarmita(
-        itens,
-        indicePerguntaPendente,
-        perguntaPendente,
-        arrozAtivo: cardapio['fluxoArrozAtivo'] == true,
-        feijaoAtivo: cardapio['fluxoFeijaoAtivo'] == true,
-      );
       if (normalizados.isNotEmpty) {
         dados['itens'] = normalizados;
       }
@@ -9701,48 +9743,6 @@ class BotService {
           'marmita ${tamanho.toLowerCase()}';
     }
     return 'para uma marmita ${tamanho.toLowerCase()}';
-  }
-
-  String _contextualizarProximaMarmita(
-    List<Map<String, dynamic>> itens,
-    int indice,
-    String pergunta, {
-    required bool arrozAtivo,
-    required bool feijaoAtivo,
-  }) {
-    if (indice <= 0 || indice >= itens.length) return pergunta;
-    final anterior = itens[indice - 1];
-    if (!_rascunhoItemCompleto(
-      anterior,
-      arrozAtivo: arrozAtivo,
-      feijaoAtivo: feijaoAtivo,
-    )) {
-      return pergunta;
-    }
-    final tamanho = anterior['tamanho']?.toString().trim() ?? '';
-    final misturas = _valoresEscolhidosRascunho(
-      anterior,
-      'misturas',
-      'mistura',
-    );
-    final acompanhamentos = _valoresEscolhidosRascunho(
-      anterior,
-      'acompanhamentos',
-      'acompanhamento',
-    );
-    final detalhes = <String>[
-      if (misturas.isNotEmpty) _juntarEmPortugues(misturas),
-      if (acompanhamentos.isNotEmpty) _juntarEmPortugues(acompanhamentos),
-    ];
-    if (tamanho.isEmpty || detalhes.isEmpty) return pergunta;
-    final quantidade = anterior['quantidade'] is num
-        ? (anterior['quantidade'] as num).toInt()
-        : 1;
-    final perguntaContinua = pergunta.isEmpty
-        ? pergunta
-        : '${pergunta[0].toLowerCase()}${pergunta.substring(1)}';
-    return 'Anotei ${quantidade > 1 ? '$quantidade marmitas' : 'uma marmita'} '
-        '$tamanho com ${detalhes.join(' e ')}. Agora, $perguntaContinua';
   }
 
   bool _ehComandoCorrigir(String entrada) => _correspondeIntencao(entrada, [
