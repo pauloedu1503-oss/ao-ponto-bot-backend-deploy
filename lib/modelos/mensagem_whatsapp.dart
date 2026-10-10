@@ -5,6 +5,7 @@ class MensagemWhatsApp {
   final String texto;
   final String? tipo;
   final String? mediaId;
+  final String? mimeType;
   final double? latitude;
   final double? longitude;
   final String? respostaId;
@@ -17,6 +18,7 @@ class MensagemWhatsApp {
     required this.texto,
     this.tipo,
     this.mediaId,
+    this.mimeType,
     this.latitude,
     this.longitude,
     this.respostaId,

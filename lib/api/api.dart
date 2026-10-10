@@ -48,18 +48,52 @@ class Api {
     try {
       final rows = banco.db.select(
           'SELECT payload, criado_em FROM webhook_entrada ORDER BY rowid LIMIT 100');
+      final registros = rows.map((row) {
+        final mensagem = jsonDecode(row['payload'] as String)
+            as Map<String, dynamic>;
+        return (
+          mensagem: mensagem,
+          criadoEm: DateTime.tryParse(row['criado_em']?.toString() ?? '')
+        );
+      }).toList();
+      final agora = DateTime.now().toUtc();
+      final ultimoTextoPorTelefone = <String, DateTime>{};
+      if (_usarJanelaAgrupamento) {
+        for (final registro in registros) {
+          final mensagem = registro.mensagem;
+          final textoSemResposta = mensagem['tipo'] == 'text' &&
+              (mensagem['respostaId'] == null ||
+                  mensagem['respostaId'].toString().isEmpty);
+          final criadoEm = registro.criadoEm?.toUtc();
+          if (textoSemResposta && criadoEm != null) {
+            final telefone = mensagem['telefone']?.toString();
+            if (telefone != null) {
+              final anterior = ultimoTextoPorTelefone[telefone];
+              if (anterior == null || criadoEm.isAfter(anterior)) {
+                ultimoTextoPorTelefone[telefone] = criadoEm;
+              }
+            }
+          }
+        }
+      }
+
+      const janelaResposta = Duration(seconds: 10);
+      final telefonesComTextoPendente = ultimoTextoPorTelefone.entries
+          .where((entry) =>
+              agora.difference(entry.value) < janelaResposta)
+          .map((entry) => entry.key)
+          .toSet();
       final grupos = <Map<String, dynamic>>[];
-      for (final row in rows) {
-        final m = jsonDecode(row['payload'] as String) as Map<String, dynamic>;
+      for (final registro in registros) {
+        final m = registro.mensagem;
         final podeAgrupar = m['tipo'] == 'text' &&
             (m['respostaId'] == null || m['respostaId'].toString().isEmpty);
-        if (_usarJanelaAgrupamento &&
-            podeAgrupar &&
-            DateTime.tryParse(row['criado_em']?.toString() ?? '') != null &&
-            DateTime.now().toUtc().difference(
-                      DateTime.parse(row['criado_em'].toString()).toUtc(),
-                    ) <
-                const Duration(seconds: 30)) {
+        final telefone = m['telefone']?.toString();
+        // Se ainda há uma mensagem recente desse cliente, aguarde a sequência
+        // inteira. Assim a janela começa na última mensagem, e não na primeira.
+        if (podeAgrupar &&
+            telefone != null &&
+            telefonesComTextoPendente.contains(telefone)) {
           continue;
         }
         final ultimo = grupos.isEmpty ? null : grupos.last;
@@ -85,6 +119,7 @@ class Api {
               texto: m['texto'],
               tipo: m['tipo'],
               mediaId: m['mediaId'],
+              mimeType: m['mimeType'],
               latitude: (m['latitude'] as num?)?.toDouble(),
               longitude: (m['longitude'] as num?)?.toDouble(),
               respostaId: m['respostaId'],
@@ -156,6 +191,8 @@ class Api {
       ..post('/api/humanos/<telefone>/parar-alerta',
           _protegido1(_humanoPararAlerta))
       ..get('/api/logs', _protegido(_logsGet))
+      ..get('/api/ia/sugestoes', _protegido(_iaSugestoesGet))
+      ..get('/api/ia/relatorio', _protegido(_iaRelatorioGet))
       ..get('/api/envios', _protegido(_enviosGet))
       ..post('/api/envios/<id|[0-9]+>/resolver', _protegido1(_envioResolver))
       ..post('/api/backup', _protegido(_backupPost))
@@ -583,6 +620,19 @@ class Api {
     return jsonResponse(banco.listarLogs(limite: limite.clamp(1, 500).toInt()));
   }
 
+  Response _iaSugestoesGet(Request request) {
+    final dias = int.tryParse(request.url.queryParameters['dias'] ?? '') ?? 7;
+    return jsonResponse({
+      'periodoDias': dias.clamp(1, 90),
+      'sugestoes': banco.sugestoesMelhoria(dias: dias),
+    });
+  }
+
+  Response _iaRelatorioGet(Request request) {
+    final dias = int.tryParse(request.url.queryParameters['dias'] ?? '') ?? 7;
+    return jsonResponse(banco.relatorioInteligencia(dias: dias));
+  }
+
   Response _backupPost(Request _) {
     final caminho = banco.gerarBackup();
     return jsonResponse({'ok': true, 'caminho': caminho});
@@ -628,14 +678,27 @@ class Api {
       );
     }
 
-    await bot.processar(
-      MensagemWhatsApp(
-        id: id,
-        telefone: telefone,
-        nome: nome?.isNotEmpty == true ? nome! : 'Cliente',
-        texto: texto,
-        respostaId: respostaId,
-      ),
+    // A ponte também entra na fila do worker. Processar diretamente aqui
+    // ignorava a janela de agrupamento e fazia o bot responder imediatamente.
+    banco.db.execute(
+      'INSERT OR IGNORE INTO webhook_entrada(id,payload,criado_em) VALUES (?,?,?)',
+      [
+        id,
+        jsonEncode({
+          'id': id,
+          'telefone': telefone,
+          'nome': nome?.isNotEmpty == true ? nome : 'Cliente',
+          'texto': texto,
+          'tipo': 'text',
+          'mediaId': null,
+          'mimeType': null,
+          'latitude': null,
+          'longitude': null,
+          'respostaId': respostaId,
+          'enviadaEm': null,
+        }),
+        DateTime.now().toUtc().toIso8601String(),
+      ],
     );
 
     return jsonResponse({
@@ -796,6 +859,7 @@ class Api {
                 'texto': m.texto,
                 'tipo': m.tipo,
                 'mediaId': m.mediaId,
+                'mimeType': m.mimeType,
                 'latitude': m.latitude,
                 'longitude': m.longitude,
                 'respostaId': m.respostaId,
@@ -865,6 +929,7 @@ class Api {
           String? respostaId;
           final type = mRaw['type']?.toString();
           String? mediaId;
+          String? mimeType;
           double? latitude;
           double? longitude;
           if (type == 'text' && mRaw['text'] is Map) {
@@ -891,6 +956,7 @@ class Api {
           } else if (mRaw[type] is Map) {
             final media = mRaw[type] as Map;
             mediaId = media['id']?.toString();
+            mimeType = media['mime_type']?.toString();
             texto = media['caption']?.toString() ?? '';
           } else {
             texto = '';
@@ -903,6 +969,7 @@ class Api {
             texto: texto,
             tipo: type,
             mediaId: mediaId,
+            mimeType: mimeType,
             latitude: latitude,
             longitude: longitude,
             respostaId: respostaId,

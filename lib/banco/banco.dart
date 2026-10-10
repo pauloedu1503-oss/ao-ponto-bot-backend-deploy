@@ -1390,6 +1390,66 @@ class Banco {
     }
   }
 
+  void registrarDiagnosticoConversa(Map<String, dynamic> diagnostico) {
+    log('INFO', 'qualidade_conversa', jsonEncode(diagnostico));
+  }
+
+  Map<String, dynamic> relatorioInteligencia({int dias = 7}) {
+    final limiteDias = dias.clamp(1, 90);
+    final rows = db.select('''
+      SELECT detalhes, criado_em FROM logs
+      WHERE evento = 'qualidade_conversa'
+        AND julianday(criado_em) >= julianday('now', ?)
+      ORDER BY id DESC
+    ''', ['-$limiteDias days']);
+    final porCategoria = <String, int>{};
+    final porEtapa = <String, int>{};
+    final exemplos = <Map<String, dynamic>>[];
+    for (final row in rows) {
+      Map<String, dynamic> item;
+      try {
+        item = Map<String, dynamic>.from(jsonDecode(row['detalhes']) as Map);
+      } catch (_) {
+        continue;
+      }
+      final categorias = (item['categorias'] as List? ?? const [])
+          .map((valor) => valor.toString())
+          .where((valor) => valor.isNotEmpty);
+      for (final categoria in categorias) {
+        porCategoria[categoria] = (porCategoria[categoria] ?? 0) + 1;
+      }
+      final etapa = item['etapaAntes']?.toString() ?? 'inicio';
+      porEtapa[etapa] = (porEtapa[etapa] ?? 0) + 1;
+      if (exemplos.length < 20 && categorias.isNotEmpty) {
+        exemplos.add({
+          'categorias': categorias.toList(),
+          'etapa': etapa,
+          'etapaDepois': item['etapaDepois'],
+          'tipoIa': item['tipoIa'],
+          'criadoEm': row['criado_em'],
+        });
+      }
+    }
+    final sugestoes = <String, String>{
+      'ia_fallback': 'Revisar disponibilidade da IA e criar teste para a entrada que caiu no fluxo determinístico.',
+      'transferencia': 'Revisar o motivo da transferência e adicionar variações ao fluxo de atendimento humano.',
+      'ambiguidade': 'Revisar sinônimos e exigir confirmação quando houver mais de uma opção possível.',
+      'correcao_cliente': 'Adicionar a frase corrigida aos testes e revisar a associação com a etapa atual.',
+      'etapa_sem_avanco': 'Verificar se a pergunta foi repetida ou se faltou tratar uma resposta válida.',
+      'pedido_incompleto': 'Adicionar um teste de pedido completo dividido em mensagens e validar os campos obrigatórios.',
+    };
+    return {
+      'periodoDias': limiteDias,
+      'totalDiagnosticos': rows.length,
+      'porCategoria': porCategoria,
+      'porEtapa': porEtapa,
+      'sugestoes': porCategoria.map((categoria, _) =>
+          MapEntry(categoria, sugestoes[categoria] ??
+              'Revisar os exemplos desse caso e criar um teste de regressão.')),
+      'exemplos': exemplos,
+    };
+  }
+
   List<Map<String, dynamic>> enviosComFalha() => db.select('''
     SELECT id, payload, status, erro, criado_em, tentativas FROM whatsapp_saida
     WHERE status IN ('falhou','incerto') ORDER BY id LIMIT 100
@@ -1433,6 +1493,71 @@ class Banco {
               'criadoEm': r['criado_em'],
             })
         .toList();
+  }
+
+  /// Converte recorrência de falhas operacionais em ações sugeridas para
+  /// revisão. O sistema não altera prompts ou regras sozinho: ele só aponta
+  /// evidências agrupadas para uma decisão segura no painel.
+  List<Map<String, dynamic>> sugestoesMelhoria({int dias = 7}) {
+    final limiteDias = dias.clamp(1, 90);
+    final rows = db.select('''
+      SELECT evento, nivel, COUNT(*) AS quantidade,
+             MAX(criado_em) AS ultima_ocorrencia
+      FROM logs
+      WHERE julianday(criado_em) >= julianday('now', ?)
+        AND evento IN (
+          'ia_indisponivel_fallback_bot', 'bot_erro',
+          'bot_transacao_desfeita', 'api_erro', 'worker_erro',
+          'midia_nao_processada'
+        )
+      GROUP BY evento, nivel
+      ORDER BY quantidade DESC, ultima_ocorrencia DESC
+    ''', ['-$limiteDias days']);
+
+    final catalogo = <String, Map<String, String>>{
+      'ia_indisponivel_fallback_bot': {
+        'titulo': 'Revisar disponibilidade da IA',
+        'acao': 'Verificar erros de rede, limite ou configuração da Groq e ampliar o fallback determinístico.',
+        'prioridade': 'alta',
+      },
+      'bot_erro': {
+        'titulo': 'Investigar falhas no fluxo do bot',
+        'acao': 'Reproduzir as mensagens próximas do horário indicado e criar um teste de regressão.',
+        'prioridade': 'alta',
+      },
+      'bot_transacao_desfeita': {
+        'titulo': 'Revisar consistência da sessão',
+        'acao': 'Verificar a transição que desfez a transação e garantir que o rascunho continue íntegro.',
+        'prioridade': 'alta',
+      },
+      'api_erro': {
+        'titulo': 'Revisar erros da API',
+        'acao': 'Agrupar a rota afetada e adicionar teste para o payload que provocou a falha.',
+        'prioridade': 'media',
+      },
+      'worker_erro': {
+        'titulo': 'Revisar processamento da fila',
+        'acao': 'Verificar mensagens pendentes, duplicadas ou presas e criar teste do ciclo de reprocessamento.',
+        'prioridade': 'alta',
+      },
+      'midia_nao_processada': {
+        'titulo': 'Melhorar interpretação de mídia',
+        'acao': 'Revisar áudio, imagem e legenda do evento e adicionar um caso de teste para a mídia recebida.',
+        'prioridade': 'media',
+      },
+    };
+
+    return rows.map((row) {
+      final evento = row['evento'].toString();
+      final base = catalogo[evento]!;
+      return {
+        'evento': evento,
+        'nivel': row['nivel'],
+        'quantidade': row['quantidade'],
+        'ultimaOcorrencia': row['ultima_ocorrencia'],
+        ...base,
+      };
+    }).toList();
   }
 
   String gerarBackup({String? diretorio}) {

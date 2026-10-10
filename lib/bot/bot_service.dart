@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:typed_data';
 
 import '../banco/banco.dart';
 import '../modelos/mensagem_whatsapp.dart';
@@ -25,8 +26,29 @@ class BotService {
       String? respostaIA;
       Map<String, dynamic>? pedidoIA;
       String? motivoTransferenciaIA;
+      String? tipoInterpretacaoIA;
+      var iaFalhou = false;
+      final etapaAntes = banco.obterSessao(msg.telefone)?['etapa']?.toString() ??
+          'inicio';
       try {
         final sessaoAtual = banco.obterSessao(msg.telefone);
+        if (msg.ehMidia && sessaoAtual?['modoHumano'] != true) {
+          final textoDaMidia = await _interpretarMidia(msg);
+          if (textoDaMidia == null) {
+            motivoTransferenciaIA = 'midia_nao_processada';
+            respostaIA =
+                'Recebi sua mídia, mas não consegui interpretá-la com segurança. Encaminhei a conversa para um atendente.';
+          } else {
+            mensagemProcessada = MensagemWhatsApp(
+              id: msg.id,
+              telefone: msg.telefone,
+              nome: msg.nome,
+              texto: textoDaMidia,
+              tipo: 'text',
+              enviadaEm: msg.enviadaEm,
+            );
+          }
+        }
         final bebidaNoResumo = _modoIaAtivo &&
                 sessaoAtual?['etapa'] == 'confirmacao' &&
                 !_sessaoExpirou(
@@ -36,7 +58,10 @@ class BotService {
                 )
             ? _capturarBebidaAdicional(msg.entrada)
             : null;
-        if (bebidaNoResumo != null) {
+        if (motivoTransferenciaIA != null) {
+          // A mídia inconclusiva já foi encaminhada; não tente interpretá-la
+          // novamente pelo fluxo textual.
+        } else if (bebidaNoResumo != null) {
           pedidoIA = {'_adicionarBebidaResumo': bebidaNoResumo};
         } else {
           final interpretacao = await _interpretarComIA(msg);
@@ -50,12 +75,15 @@ class BotService {
                   'tamanho=${msg.entrada.length}',
             );
             if (interpretacao.tipo == 'pedido') {
+              tipoInterpretacaoIA = 'pedido';
               pedidoIA = interpretacao.pedido;
             } else if (interpretacao.tipo == 'humano') {
+              tipoInterpretacaoIA = 'humano';
               motivoTransferenciaIA =
                   interpretacao.motivoHumano ?? 'duvida_nao_respondida';
               respostaIA = interpretacao.texto;
             } else if (interpretacao.tipo == 'escolha') {
+              tipoInterpretacaoIA = 'escolha';
               mensagemProcessada = MensagemWhatsApp(
                 id: msg.id,
                 telefone: msg.telefone,
@@ -65,6 +93,7 @@ class BotService {
               );
             } else if (!_textoIaRepeteCliente(
                 interpretacao.texto, msg.entrada)) {
+              tipoInterpretacaoIA = interpretacao.tipo;
               respostaIA = interpretacao.texto;
             }
           }
@@ -75,6 +104,7 @@ class BotService {
         final detalhe =
             e is HttpExceptionSeguro ? e.message : e.runtimeType.toString();
         banco.log('WARN', 'ia_indisponivel_fallback_bot', detalhe);
+        iaFalhou = true;
       }
       if (motivoTransferenciaIA != null) {
         banco.definirModoHumano(
@@ -91,6 +121,17 @@ class BotService {
           mensagemProcessada,
           respostaIA: respostaIA,
           pedidoIA: pedidoIA,
+        );
+        final etapaDepois = banco.obterSessao(msg.telefone)?['etapa']?.toString() ??
+            'inicio';
+        _registrarDiagnosticoConversa(
+          msg,
+          etapaAntes: etapaAntes,
+          etapaDepois: etapaDepois,
+          tipoIa: tipoInterpretacaoIA,
+          motivoTransferencia: motivoTransferenciaIA,
+          pedidoIa: pedidoIA,
+          iaFalhou: iaFalhou,
         );
         _registrarHistoricoIa(msg);
         banco.db.execute('DELETE FROM webhook_entrada WHERE id = ?', [msg.id]);
@@ -823,6 +864,21 @@ class BotService {
     Map<String, dynamic> captura,
   ) async {
     final dados = Map<String, dynamic>.from(sessao?['dados'] as Map? ?? {});
+    final observacaoNoPedido = _extrairObservacaoNoMeioDoPedido(msg.entrada);
+    if (observacaoNoPedido != null) {
+      dados['observacao'] = observacaoNoPedido;
+      banco.salvarSessao(
+        telefone: msg.telefone,
+        nome: msg.nome,
+        etapa: 'ia_pedido',
+        dados: dados,
+      );
+      await whatsapp.enviarTexto(
+        msg.telefone,
+        'Anotei sua observação. Pode continuar me passando os detalhes do pedido.',
+      );
+      return;
+    }
     // Retomar pelo painel é silencioso. A primeira mensagem seguinte é entrada
     // real do cliente e não deve deixar o marcador preso no rascunho.
     if (dados.remove('aguardaBoasVindas') == true) {
@@ -1092,17 +1148,22 @@ class BotService {
           'Vamos montar a sua marmita. Quantas marmitas vai ser?',
         );
       } else if ((totalMarmitas ?? 0) > 1) {
-        await whatsapp.enviarTexto(
-          msg.telefone,
-          'Vamos montar suas marmitas. Quais tamanhos você prefere?',
-        );
+        itens.addAll(List.generate(
+          totalMarmitas!,
+          (indice) => <String, dynamic>{
+            'indice': indice + 1,
+            'quantidade': 1,
+          },
+        ));
+        rascunho['itens'] = itens;
+        dados['rascunhoPedidoIA'] = rascunho;
       } else {
         await whatsapp.enviarTexto(
           msg.telefone,
           'Vamos montar a sua marmita. Qual tamanho você prefere?',
         );
       }
-      return;
+      if (itens.isEmpty) return;
     }
 
     final normalizados = <Map<String, dynamic>>[];
@@ -1163,21 +1224,9 @@ class BotService {
           : null;
 
       if (tamanho == null) {
-        final totalMarmitas = rascunho['quantidadeTotalSolicitada'] is num
-            ? (rascunho['quantidadeTotalSolicitada'] as num).toInt()
-            : null;
-        final pergunta = itens.length == 1 && (totalMarmitas ?? 0) > 1
-            ? 'Quais tamanhos você prefere?'
-            : itens.length == 1
-                ? _perguntaDetalhesPrimeiraMarmita(cardapio)
-                : 'Qual tamanho você prefere para a próxima marmita?';
-        perguntaPendente = itens.length == 1 && (totalMarmitas ?? 0) <= 1
-            ? pergunta
-            : _perguntaOpcaoIA(
-                pergunta,
-                _itensAtivos(cardapio, 'tamanhos'),
-                'tamanho',
-              );
+        // Cada marmita é coletada com a mesma pergunta simples. Os índices
+        // continuam apenas no estado interno para associar as respostas.
+        perguntaPendente = _perguntaDetalhesPrimeiraMarmita(cardapio);
       } else if (arrozAtivo && arroz == null) {
         final referencia = _referenciaMarmitaIa(
           itens,
@@ -1218,9 +1267,12 @@ class BotService {
             .where((opcao) =>
                 !misturas.any((escolhida) => escolhida['id'] == opcao['id']))
             .toList();
+        final tamanhoNome = tamanho['nome']?.toString().trim() ?? '';
         final pergunta = quantidadeMisturas == 1
             ? 'Qual mistura você prefere $referencia?'
-            : 'Qual outra mistura você prefere $referencia?';
+            : misturas.length == 1 && tamanhoNome.isNotEmpty
+                ? 'Você pode escolher a segunda mistura para sua marmita $tamanhoNome. Vai querer qual?'
+                : 'Você pode escolher mais uma mistura $referencia. Vai querer qual?';
         perguntaPendente = _perguntaOpcaoIA(
           pergunta,
           restantes,
@@ -1244,9 +1296,12 @@ class BotService {
             .where((opcao) => !acompanhamentos
                 .any((escolhida) => escolhida['id'] == opcao['id']))
             .toList();
+        final tamanhoNome = tamanho['nome']?.toString().trim() ?? '';
         final pergunta = quantidadeAcompanhamentos == 1
             ? 'Qual acompanhamento você prefere $referencia?'
-            : 'Qual outro acompanhamento você prefere $referencia?';
+            : acompanhamentos.length == 1 && tamanhoNome.isNotEmpty
+                ? 'Você pode escolher o segundo acompanhamento para sua marmita $tamanhoNome. Vai querer qual?'
+                : 'Você pode escolher mais um acompanhamento $referencia. Vai querer qual?';
         perguntaPendente = _perguntaOpcaoIA(
           pergunta,
           restantes,
@@ -1357,8 +1412,57 @@ class BotService {
   }
 
   String _perguntaDetalhesPrimeiraMarmita(Map<String, dynamic> cardapio) {
-    final tamanhos = _itensAtivos(cardapio, 'tamanhos');
-    return 'Qual será o tamanho, a mistura${tamanhos.any((item) => (item['quantidadeMisturas'] as num? ?? 1) > 1) ? '(ou misturas)' : ''} e o acompanhamento?';
+    return 'Qual será o tamanho, a mistura e o acompanhamento?';
+  }
+
+  Future<String?> _interpretarMidia(MensagemWhatsApp msg) async {
+    final mediaId = msg.mediaId;
+    if (mediaId == null || mediaId.trim().isEmpty) return null;
+    final midia = await whatsapp.baixarMidia(
+      mediaId,
+      mimeType: msg.mimeType,
+    );
+    if (midia == null) return null;
+    if (msg.tipo == 'audio' || msg.tipo == 'voice') {
+      final extensao = midia.mimeType.split('/').last.split(';').first;
+      final transcricao = await ia.transcreverAudio(
+        Uint8List.fromList(midia.bytes),
+        filename: 'audio.$extensao',
+      );
+      if (transcricao == null) return null;
+      return [
+        if (msg.texto.trim().isNotEmpty) msg.texto.trim(),
+        transcricao,
+      ].join('\n');
+    }
+    if (msg.tipo == 'image') {
+      final leitura = await ia.interpretarImagem(
+        Uint8List.fromList(midia.bytes),
+        mimeType: midia.mimeType,
+      );
+      if (leitura == null) return null;
+      return [
+        if (msg.texto.trim().isNotEmpty) msg.texto.trim(),
+        leitura,
+      ].join('\n');
+    }
+    return null;
+  }
+
+  String? _extrairObservacaoNoMeioDoPedido(String entrada) {
+    final valor = RegExp(
+      r'^\s*(?:(?:obs(?:erva(?:c|ç)(?:a|ã)o)?|observa(?:c|ç)(?:a|ã)o)|(?:anota|anote|pode anotar|detalhe|detalhe importante)|(?:quero|vai|pode)\s+sem)\s*[:=-]?\s*(.+)$',
+      caseSensitive: false,
+    ).firstMatch(entrada.trim());
+    final observacao = valor?.group(1)?.trim();
+    if (observacao == null ||
+        observacao.isEmpty ||
+        observacao.length > 300 ||
+        RegExp(r'^(?:bebida|marmita|pedido)\b', caseSensitive: false)
+            .hasMatch(observacao)) {
+      return null;
+    }
+    return observacao;
   }
 
   bool _rascunhoItemCompleto(
@@ -2032,13 +2136,25 @@ class BotService {
           'pode ser',
           'pode sim',
           'mais',
-          'mais uma',
-          'outra',
+           'mais uma',
+           'mais uma marmita',
+           'mais um prato',
+           'adiciona mais uma',
+           'adicionar mais uma',
+           'inclui mais uma',
+           'incluir mais uma',
+           'coloca mais uma',
+           'quero outra marmita',
+           'queria outra marmita',
+           'vou querer outra marmita',
+           'pode adicionar outra',
+           'pode incluir outra',
+           'outra',
           'adicionar outra',
           'sim por favor',
         ]) ||
         RegExp(
-          r'^(?:(?:quero|queria|vou querer)(?:\s+(?:mais(?: uma)?|outra|uma|adicionar outra)(?:\s+marmita)?)?|(?:adicionar|adiciona) outra(?:\s+marmita)?)$',
+          r'^(?:(?:quero|queria|vou querer|gostaria de|pode adicionar|pode incluir|coloca|inclui|incluir|adiciona|adicionar)\s+(?:(?:mais\s+)?uma|outra|mais uma|outra marmita|mais uma marmita|outra refeicao|outro prato)(?:\s+por favor)?)$',
         ).hasMatch(texto);
   }
 
@@ -2257,7 +2373,10 @@ class BotService {
         banco.finalizarMensagem(msg.id);
         return;
       }
-      if (msg.ehMidia && msg.entrada.isEmpty) {
+      // Legenda não é o conteúdo da mídia. Sem transcrição/OCR configurado,
+      // nunca trate uma legenda de áudio ou imagem como se fosse o pedido
+      // completo do cliente; encaminhe a mídia para avaliação humana.
+      if (msg.ehMidia) {
         banco.definirModoHumano(
           msg.telefone,
           true,
@@ -4629,6 +4748,7 @@ class BotService {
     dados.remove('bebidas');
     dados.remove('taxaEntregaCongelada');
     dados.remove('cidadeConfirmadaCliente');
+    dados.remove('ultimaLocalizacao');
   }
 
   Future<void> _pedirEndereco(
@@ -4663,6 +4783,9 @@ class BotService {
   ) async {
     final endereco =
         msg.texto.trim().isNotEmpty ? msg.texto.trim() : msg.entrada.trim();
+    // Uma nova tentativa de endereço invalida qualquer localização recebida
+    // antes, evitando que coordenadas antigas fiquem associadas ao pedido.
+    dados.remove('ultimaLocalizacao');
 
     if (_ehIntencaoRetirada(endereco)) {
       final enderecoRetirada =
@@ -5329,7 +5452,19 @@ class BotService {
   }
 
   bool _mencionaBebidaNoTexto(String texto) {
-    if (_contemTermo(texto, ['bebida', 'bebidas'])) return true;
+    if (_contemTermo(texto, [
+      'bebida',
+      'bebidas',
+      'refri',
+      'refrigerante',
+      'refrigerantes',
+      'suco',
+      'sucos',
+      'agua',
+      'aguas',
+      'água',
+      'águas',
+    ])) return true;
     for (final bebida in _bebidasAtivas()) {
       final nome = _normalizar(bebida['nome']?.toString() ?? '');
       if (nome.isEmpty) continue;
@@ -5974,7 +6109,7 @@ class BotService {
       );
       await whatsapp.enviarTexto(
         msg.telefone,
-        'Qual outra $singular você prefere? (${selecionadas.length + 1} de $quantidade). ${_opcoesEmTexto(opcoes)}',
+        'Qual outra $singular você prefere? ${_opcoesEmTexto(opcoes)}',
       );
       return true;
     }
@@ -6179,7 +6314,7 @@ class BotService {
     final misturas = _nomeEscolhasItem(item, 'misturaNomes', 'misturaNome');
     final acompanhamentos =
         _nomeEscolhasItem(item, 'acompanhamentoNomes', 'acompanhamentoNome');
-    return '${indice + 1}) ${quantidade}x ${item['tamanhoNome']} — '
+    return '• ${quantidade}x ${item['tamanhoNome']} — '
         '$misturas com $acompanhamentos';
   }
 
@@ -6565,10 +6700,31 @@ class BotService {
         .whereType<Map>()
         .map((item) => Map<String, dynamic>.from(item))
         .toList();
-    if (bebidas.isEmpty) return false;
-
     final texto = _normalizarIntencao(entrada);
     if (!_mencionaBebidaNoTexto(texto)) return false;
+    if (bebidas.isEmpty) {
+      final bebida = _capturarBebidaAdicional(entrada);
+      if (bebida != null) {
+        await _adicionarBebidaAoResumo(
+          msg,
+          config,
+          banco.obterSessao(msg.telefone),
+          bebida,
+        );
+      } else {
+        banco.salvarSessao(
+          telefone: msg.telefone,
+          nome: msg.nome,
+          etapa: 'confirmacao',
+          dados: dados,
+        );
+        await whatsapp.enviarTexto(
+          msg.telefone,
+          'Qual bebida você gostaria de incluir?',
+        );
+      }
+      return true;
+    }
     final troca = RegExp(
       r'(?:troca|trocar|muda|mudar|substitui(?:r)?)\s+(?:a|o|as|os)?\s*(?:bebida\s+)?(.+?)\s+(?:por|para)\s+(.+)$',
     ).firstMatch(texto);
@@ -8409,7 +8565,53 @@ class BotService {
         : hora >= 12 && hora < 18
             ? 'Boa tarde'
             : 'Boa noite';
-    return '$cumprimento! 😊';
+    return '$cumprimento! Seja bem-vindo(a) à *Ao Ponto Marmitaria*! 😊';
+  }
+
+  void _registrarDiagnosticoConversa(
+    MensagemWhatsApp msg, {
+    required String etapaAntes,
+    required String etapaDepois,
+    required String? tipoIa,
+    required String? motivoTransferencia,
+    required Map<String, dynamic>? pedidoIa,
+    required bool iaFalhou,
+  }) {
+    final entrada = _normalizar(msg.entrada);
+    final categorias = <String>{};
+    if (iaFalhou) categorias.add('ia_fallback');
+    if (motivoTransferencia != null) categorias.add('transferencia');
+    if (RegExp(r'\b(na verdade|corrigindo|troca|trocar|mudei)\b')
+        .hasMatch(entrada)) {
+      categorias.add('correcao_cliente');
+    }
+    if (RegExp(r'\b(nao sei|não sei|qualquer um|tanto faz|essa|a mesma)\b')
+        .hasMatch(entrada)) {
+      categorias.add('ambiguidade');
+    }
+    if (etapaAntes == etapaDepois && entrada.isNotEmpty &&
+        (tipoIa == 'duvida' || tipoIa == 'escolha')) {
+      categorias.add('etapa_sem_avanco');
+    }
+    final itens = pedidoIa?['itens'];
+    if (pedidoIa != null && itens is List && itens.isNotEmpty &&
+        itens.any((item) => item is Map &&
+            (item['tamanho'] == null || item['misturas'] == null))) {
+      categorias.add('pedido_incompleto');
+    }
+    // Conversas normais não geram diagnóstico. Assim, o recurso não cria
+    // uma segunda trilha de histórico nem aumenta o banco desnecessariamente.
+    if (categorias.isEmpty) return;
+    banco.registrarDiagnosticoConversa({
+      'etapaAntes': etapaAntes,
+      'etapaDepois': etapaDepois,
+      'tipoIa': tipoIa,
+      'motivoTransferencia': motivoTransferencia,
+      'categorias': categorias.toList(),
+      'temPedidoIa': pedidoIa != null,
+      'entradaTamanho': msg.entrada.length,
+      'em': agoraIso(),
+    });
   }
 
   bool get _modoIaAtivo {

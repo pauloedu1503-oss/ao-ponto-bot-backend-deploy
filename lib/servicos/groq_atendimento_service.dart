@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
 
@@ -27,6 +28,90 @@ class GroqAtendimentoService {
 
   bool get configurado =>
       (_apiKey ?? Env.get('GROQ_API_KEY')).trim().isNotEmpty;
+
+  Future<String?> transcreverAudio(
+    Uint8List bytes, {
+    String filename = 'audio.ogg',
+  }) async {
+    final chave = (_apiKey ?? Env.get('GROQ_API_KEY')).trim();
+    if (chave.isEmpty || bytes.isEmpty || bytes.length > 100 * 1024 * 1024) {
+      return null;
+    }
+    final request = http.MultipartRequest(
+      'POST',
+      Uri.parse('https://api.groq.com/openai/v1/audio/transcriptions'),
+    )
+      ..headers['Authorization'] = 'Bearer $chave'
+      ..fields['model'] = Env.get(
+        'GROQ_AUDIO_MODEL',
+        padrao: 'whisper-large-v3-turbo',
+      )
+      ..fields['language'] = 'pt'
+      ..fields['response_format'] = 'json'
+      ..files.add(http.MultipartFile.fromBytes('file', bytes, filename: filename));
+    final response = await request.send().timeout(const Duration(seconds: 20));
+    if (response.statusCode < 200 || response.statusCode >= 300) return null;
+    final body = await response.stream.bytesToString();
+    final json = jsonDecode(body);
+    final texto = json is Map ? json['text']?.toString().trim() : null;
+    return texto?.isNotEmpty == true ? texto : null;
+  }
+
+  Future<String?> interpretarImagem(
+    Uint8List bytes, {
+    required String mimeType,
+  }) async {
+    final chave = (_apiKey ?? Env.get('GROQ_API_KEY')).trim();
+    if (chave.isEmpty || bytes.isEmpty || bytes.length > 20 * 1024 * 1024) {
+      return null;
+    }
+    final dataUrl = 'data:$mimeType;base64,${base64Encode(bytes)}';
+    final response = await _client
+        .post(
+          Uri.parse('https://api.groq.com/openai/v1/chat/completions'),
+          headers: {
+            'Authorization': 'Bearer $chave',
+            'Content-Type': 'application/json',
+          },
+          body: jsonEncode({
+            'model': Env.get(
+              'GROQ_VISION_MODEL',
+              padrao: 'qwen/qwen3.8-27b',
+            ),
+            'temperature': 0,
+            'max_completion_tokens': 800,
+            'messages': [
+              {
+                'role': 'user',
+                'content': [
+                  {
+                    'type': 'text',
+                    'text':
+                        'Leia esta imagem. Extraia somente o pedido ou a dúvida do cliente em português brasileiro. Se não houver pedido ou texto legível, responda apenas INCONCLUSIVO.',
+                  },
+                  {
+                    'type': 'image_url',
+                    'image_url': {'url': dataUrl},
+                  },
+                ],
+              },
+            ],
+          }),
+        )
+        .timeout(const Duration(seconds: 20));
+    if (response.statusCode < 200 || response.statusCode >= 300) return null;
+    final envelope = jsonDecode(response.body);
+    final choices = envelope is Map ? envelope['choices'] : null;
+    final content = choices is List && choices.isNotEmpty
+        ? (((choices.first as Map)['message'] as Map?)?['content'])
+            ?.toString()
+            .trim()
+        : null;
+    if (content == null || content.isEmpty || content == 'INCONCLUSIVO') {
+      return null;
+    }
+    return content.length <= 2000 ? content : content.substring(0, 2000);
+  }
 
   Future<InterpretacaoAtendimento?> interpretar({
     required String mensagem,
@@ -199,6 +284,9 @@ INTENÇÃO: MONTAR O PEDIDO
 - Distinga pergunta de escolha. “Vocês não têm calabresa?” ou “calabresa tem?” é uma pergunta de disponibilidade, não escolha de mistura. Responda usando o cardápio. “Calabresa” ou “pode ser calabresa” durante a pergunta sobre mistura é uma escolha.
 - Ao perguntar se quer outra marmita, “sim”, “quero”, “vou querer”, “vou quere”, “mais uma” ou equivalente autoriza iniciar a coleta da próxima. Isso não adiciona uma marmita vazia nem confirma novamente a anterior. “Não”, “só isso” ou “finalizar” encerra a inclusão. Uma resposta afirmativa isolada fora de uma etapa que espere confirmação não confirma o pedido inteiro. No resumo, só classifique confirmação quando a mensagem declarar claramente que a pessoa confirma o pedido. “ok”, “isso”, “beleza”, “certo”, “manda” e elogios isolados são ambíguos, não confirmam nem cancelam; peça esclarecimento. Diante de cancelamento, exija intenção de cancelar explicitamente; “sim” ou “isso” isolados nunca cancelam.
 - Não transforme dúvida, saudação, “vou querer” sem detalhes ou resposta ambígua em pedido completo. Não repita “item adicionado” se não houve item novo.
+- TRATE CONTRADIÇÕES COM SEGURANÇA: se a mensagem disser duas quantidades, tamanhos, misturas, acompanhamentos ou intenções incompatíveis (por exemplo, “uma marmita” e depois “duas”, ou “cancela” e “pode confirmar”), não escolha uma delas e não altere o pedido. Peça uma confirmação curta sobre qual informação vale.
+- TRATE AMBIGUIDADES SEM CHUTE: palavras como “carne”, “frango”, “arroz”, “a mesma”, “essa” ou “mais uma” só devem ser associadas quando houver uma única opção ou referência clara no estado atual. Se houver mais de uma possibilidade, peça o detalhe mínimo necessário e preserve o rascunho.
+- CORREÇÕES TÊM PRIORIDADE APENAS QUANDO EXPLÍCITAS: “na verdade”, “troca”, “corrigindo” e equivalentes podem substituir um dado já salvo somente quando identificarem claramente o campo e o novo valor. Caso contrário, trate como nova informação pendente, sem sobrescrever o pedido.
 
 COMO CONVERSAR
 - Seja acolhedora e objetiva. No início de um pedido, descubra primeiro quantas marmitas serão. Quando for apenas uma, peça tamanho, mistura(s) e acompanhamento na mesma pergunta e aceite que o cliente responda tudo de uma vez. Não faça uma sequência de perguntas separadas para esses três dados. Se a quantidade for maior que uma, associe os detalhes a cada marmita e aceite respostas completas para várias delas na mesma mensagem.
