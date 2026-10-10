@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:typed_data';
 
 import '../banco/banco.dart';
@@ -86,6 +87,21 @@ class BotService {
           // Não envie essas entradas outra vez para a IA.
         } else if (bebidaNoResumo != null) {
           pedidoIA = {'_adicionarBebidaResumo': bebidaNoResumo};
+        } else if ((sessaoAtual?['dados'] as Map?)?['referenciaPendenteIA']
+                is Map &&
+            RegExp(
+              r'\b(?:a\s+)?(?:primeira|primeiro|1a|1o|1|segunda|segundo|2a|2o|2|terceira|terceiro|3a|3o|3)\b',
+            ).hasMatch(_normalizarIntencao(mensagemProcessada.entrada))) {
+          // Uma resposta ordinal resolve a pergunta de desambiguação usando
+          // os índices guardados na sessão; não dependa de a IA classificar
+          // "a primeira" como pedido ou como escolha.
+          pedidoIA = {
+            'tipo': 'pedido',
+            'texto': '',
+            'itens': <dynamic>[],
+            'finalizarItens': false,
+          };
+          tipoInterpretacaoIA = 'pedido';
         } else {
           // A IA precisa receber o conteúdo já transcrito/extraído da mídia.
           // Usar `msg` aqui descartava o áudio ou a imagem e analisava apenas
@@ -425,7 +441,11 @@ class BotService {
         sessao,
         permitirTamanhoSemQuantidade: compostas != null,
       );
-      if (compostas != null || tamanhos != null) {
+      final mensagemComReferenciaEntreItens = RegExp(
+        r'\b(?:outra|outro|cada|primeira|primeiro|segunda|segundo|terceira|terceiro|ambas|ambos)\b|\b(?:nas\s+duas|em\s+ambas|para\s+as\s+duas|pras\s+duas|nos\s+dois|em\s+ambos)\b',
+      ).hasMatch(_normalizarIntencao(msg.entrada));
+      if ((compostas != null || tamanhos != null) &&
+          !mensagemComReferenciaEntreItens) {
         final itensCombinados = <int, Map<String, dynamic>>{};
         for (final item in tamanhos ?? const <Map<String, dynamic>>[]) {
           final indice = (item['indice'] as num?)?.toInt();
@@ -1065,70 +1085,126 @@ class BotService {
         .map((item) => Map<String, dynamic>.from(item))
         .toList();
     final itens = <Map<String, dynamic>>[];
-    for (final raw in (dados['itens'] as List? ?? const [])) {
-      if (raw is! Map) continue;
-      final item = Map<String, dynamic>.from(raw);
-      final misturas = item['misturaNomes'] is List
-          ? List<String>.from(item['misturaNomes'] as List)
-          : [if (item['misturaNome'] != null) item['misturaNome'].toString()];
-      final acompanhamentos = item['acompanhamentoNomes'] is List
-          ? List<String>.from(item['acompanhamentoNomes'] as List)
-          : [
-              if (item['acompanhamentoNome'] != null)
-                item['acompanhamentoNome'].toString()
-            ];
-      itens.add({
-        'indice': itens.length + 1,
-        'tamanho': item['tamanhoNome'],
-        'quantidade': item['quantidade'],
-        'quantidadeMisturas': item['quantidadeMisturas'] ?? 1,
-        'quantidadeAcompanhamentos': item['quantidadeAcompanhamentos'] ?? 1,
-        'misturas': misturas,
-        if (misturas.isNotEmpty) 'mistura': misturas.first,
-        'acompanhamentos': acompanhamentos,
-        if (acompanhamentos.isNotEmpty) 'acompanhamento': acompanhamentos.first,
-        'arroz': item['arrozNome'],
-        'feijao': item['feijaoNome'],
-      });
-    }
     if (rascunhoAnterior.isNotEmpty) {
-      if (itens.isEmpty) {
-        itens.addAll(rascunhoAnterior);
-      } else {
-        String chave(Map<String, dynamic> linha) => [
-              _normalizar(linha['tamanho']?.toString() ?? ''),
-              _valoresEscolhidosRascunho(linha, 'misturas', 'mistura')
-                  .map(_normalizar)
-                  .join(','),
-              _valoresEscolhidosRascunho(
-                linha,
-                'acompanhamentos',
-                'acompanhamento',
-              ).map(_normalizar).join(','),
-              _normalizar(linha['arroz']?.toString() ?? ''),
-              _normalizar(linha['feijao']?.toString() ?? ''),
-            ].join('|');
-        final presentes = itens.map(chave).toSet();
-        for (final linha in rascunhoAnterior) {
-          if (_rascunhoItemCompleto(
-            Map<String, dynamic>.from(linha),
-            arrozAtivo: cardapio['fluxoArrozAtivo'] == true,
-            feijaoAtivo: cardapio['fluxoFeijaoAtivo'] == true,
-          )) {
-            continue;
-          }
-          if (presentes.add(chave(linha))) itens.add(linha);
-        }
-      }
+      // O rascunho é a fonte de verdade durante a coleta: ele mantém uma linha
+      // independente por marmita. `dados['itens']` é a representação já
+      // validada/agrupada para o pedido e não pode ser mesclada de volta aqui,
+      // pois combinações iguais podem ter sido agregadas (quantidade > 1).
+      itens.addAll(rascunhoAnterior);
       for (var i = 0; i < itens.length; i++) {
         itens[i]['indice'] = i + 1;
+      }
+    } else {
+      // Compatibilidade com sessões antigas que possuem pedido persistido, mas
+      // ainda não têm um rascunho estruturado.
+      for (final raw in (dados['itens'] as List? ?? const [])) {
+        if (raw is! Map) continue;
+        final item = Map<String, dynamic>.from(raw);
+        final misturas = item['misturaNomes'] is List
+            ? List<String>.from(item['misturaNomes'] as List)
+            : [if (item['misturaNome'] != null) item['misturaNome'].toString()];
+        final acompanhamentos = item['acompanhamentoNomes'] is List
+            ? List<String>.from(item['acompanhamentoNomes'] as List)
+            : [
+                if (item['acompanhamentoNome'] != null)
+                  item['acompanhamentoNome'].toString()
+              ];
+        final quantidade = item['quantidade'] is num
+            ? (item['quantidade'] as num).toInt().clamp(1, 50)
+            : 1;
+        for (var unidade = 0; unidade < quantidade; unidade++) {
+          final itemIds = (item['itemIds'] as List? ?? const [])
+              .map((id) => id.toString())
+              .toList();
+          itens.add({
+            'indice': itens.length + 1,
+            if (unidade < itemIds.length) 'itemId': itemIds[unidade],
+            'tamanho': item['tamanhoNome'],
+            'quantidade': 1,
+            'quantidadeMisturas': item['quantidadeMisturas'] ?? 1,
+            'quantidadeAcompanhamentos': item['quantidadeAcompanhamentos'] ?? 1,
+            'misturas': misturas,
+            if (misturas.isNotEmpty) 'mistura': misturas.first,
+            'acompanhamentos': acompanhamentos,
+            if (acompanhamentos.isNotEmpty)
+              'acompanhamento': acompanhamentos.first,
+            'arroz': item['arrozNome'],
+            'feijao': item['feijaoNome'],
+            if (item['observacao'] is String) 'observacao': item['observacao'],
+          });
+        }
       }
     }
     final totalSolicitado = _extrairTotalMarmitas(msg.entrada);
     if (totalSolicitado != null) {
       rascunho['quantidadeTotalSolicitada'] = totalSolicitado;
     }
-    final atualizacoes = captura['itens'];
+    final quantidadeMarmitas = rascunho['quantidadeTotalSolicitada'] is num
+        ? (rascunho['quantidadeTotalSolicitada'] as num).toInt()
+        : null;
+    if (itens.isEmpty && quantidadeMarmitas != null && quantidadeMarmitas > 0) {
+      itens.addAll(List.generate(
+        quantidadeMarmitas.clamp(1, 20),
+        (indice) => <String, dynamic>{
+          'indice': indice + 1,
+          'quantidade': 1,
+        },
+      ));
+    }
+    _garantirIdsItensRascunho(rascunho, itens);
+    final estadosAnteriores = <String, Map<String, dynamic>>{
+      for (final item in itens)
+        item['itemId'].toString(): {
+          for (final campo in const [
+            'tamanho',
+            'misturas',
+            'acompanhamentos',
+            'arroz',
+            'feijao',
+            'quantidade',
+            'observacao',
+          ])
+            campo: item[campo],
+        },
+    };
+    final atualizacoesOriginais = captura['itens'];
+    var atualizacoes = atualizacoesOriginais is List
+        ? _expandirReferenciasCompartilhadas(
+            msg.entrada,
+            atualizacoesOriginais.whereType<Map>().toList(),
+            itens,
+            cardapio,
+          )
+        : atualizacoesOriginais;
+    final referenciaPendente = dados['referenciaPendenteIA'];
+    var referenciaPendenteResolvida = false;
+    if (referenciaPendente is Map && atualizacoes is List) {
+      final alvos = (referenciaPendente['alvos'] as List? ?? const [])
+          .whereType<num>()
+          .map((indice) => indice.toInt())
+          .toList();
+      final normalizada = _normalizarIntencao(msg.entrada);
+      final ordinal = RegExp(
+        r'\b(?:a\s+)?(primeira|primeiro|1a|1o|1|segunda|segundo|2a|2o|2|terceira|terceiro|3a|3o|3)\b',
+      ).firstMatch(normalizada)?.group(1);
+      final posicao = switch (ordinal) {
+        'primeira' || 'primeiro' || '1a' || '1o' || '1' => 0,
+        'segunda' || 'segundo' || '2a' || '2o' || '2' => 1,
+        'terceira' || 'terceiro' || '3a' || '3o' || '3' => 2,
+        _ => -1,
+      };
+      if (posicao >= 0 && posicao < alvos.length) {
+        final guardada = Map<String, dynamic>.from(
+          referenciaPendente['atualizacao'] as Map? ?? const {},
+        )..['indice'] = alvos[posicao];
+        atualizacoes = [
+          ...atualizacoes.whereType<Map>(),
+          guardada,
+        ];
+        dados.remove('referenciaPendenteIA');
+        referenciaPendenteResolvida = true;
+      }
+    }
     final temAtualizacaoDeItem = atualizacoes is List &&
         atualizacoes.whereType<Map>().any((item) => const [
               'tamanho',
@@ -1141,15 +1217,25 @@ class BotService {
               'feijao',
               'quantidadeMisturasDesejada',
               'quantidadeAcompanhamentosDesejada',
+              'observacao',
             ].any((campo) =>
                 item[campo] != null &&
                 item[campo].toString().trim().isNotEmpty));
+    var precisaEsclarecerReferencia = false;
     if (atualizacoes is List) {
       for (final original in atualizacoes.whereType<Map>()) {
         final raw = _corrigirCamposEscolhasIA(
           Map<String, dynamic>.from(original),
           cardapio,
         );
+        if (raw.remove('_referenciaAmbigua') == true) {
+          precisaEsclarecerReferencia = true;
+          dados['referenciaPendenteIA'] = {
+            'atualizacao': raw,
+            'alvos': raw.remove('_alvosReferenciaAmbigua'),
+          };
+          continue;
+        }
         final indiceRaw = raw['indice'];
         var indice = indiceRaw is num ? indiceRaw.toInt() : 0;
         if (indice < 1) {
@@ -1272,28 +1358,49 @@ class BotService {
             }
           }
         }
+        final observacao = raw['observacao'];
+        if (observacao is String &&
+            observacao.trim().isNotEmpty &&
+            observacao.trim().length <= 300) {
+          destino['observacao'] = observacao.trim();
+        }
       }
     }
-    if (atualizacoes is List && atualizacoes.isNotEmpty) {
-      // Mudança nas marmitas invalida dados derivados do resumo anterior.
-      for (final campo in const [
-        'recebimento',
-        'endereco',
-        'enderecoPendente',
-        'enderecoValidado',
-        'cepEntrega',
-        'cidadeEntrega',
-        'cidadeEntregaId',
-        'ufEntrega',
-        'cidadeConfirmadaCliente',
-        'taxaEntregaCongelada',
-        'pagamento',
-        'trocoPara',
-        'bebidas',
-      ]) {
-        dados.remove(campo);
-      }
-      dados['bebidas'] = <dynamic>[];
+    if (precisaEsclarecerReferencia) {
+      banco.salvarSessao(
+        telefone: msg.telefone,
+        nome: msg.nome,
+        etapa: 'ia_pedido',
+        dados: dados,
+      );
+      await whatsapp.enviarTexto(
+        msg.telefone,
+        'Você tem mais de uma marmita pequena. Essa escolha é para a primeira, a segunda ou outra? ',
+      );
+      return;
+    }
+    if (dados['referenciaPendenteIA'] is Map &&
+        referenciaPendente is Map &&
+        !referenciaPendenteResolvida) {
+      banco.salvarSessao(
+        telefone: msg.telefone,
+        nome: msg.nome,
+        etapa: 'ia_pedido',
+        dados: dados,
+      );
+      await whatsapp.enviarTexto(
+        msg.telefone,
+        'Qual delas você quer alterar: a primeira, a segunda ou outra? ',
+      );
+      return;
+    }
+    _garantirIdsItensRascunho(rascunho, itens);
+    for (final item in itens) {
+      _registrarHistoricoAlteracoesRascunho(
+        item,
+        estadosAnteriores[item['itemId'].toString()] ?? const {},
+        cardapio,
+      );
     }
     rascunho['itens'] = itens;
     dados['rascunhoPedidoIA'] = rascunho;
@@ -1304,6 +1411,9 @@ class BotService {
       rascunho['itens'] = itens;
       dados['rascunhoPedidoIA'] = rascunho;
     }
+    _garantirIdsItensRascunho(rascunho, itens);
+    rascunho['itens'] = itens;
+    dados['rascunhoPedidoIA'] = rascunho;
 
     // Mensagens como "vou querer" não completam nem adicionam uma marmita.
     // Preserve os itens prontos e continue perguntando pelo próximo dado.
@@ -1373,6 +1483,7 @@ class BotService {
 
     final normalizados = <Map<String, dynamic>>[];
     String? perguntaPendente;
+    var indicePerguntaPendente = -1;
     for (var i = 0; i < itens.length; i++) {
       final item = itens[i];
       final tamanho = _resolverOpcaoNatural(
@@ -1457,6 +1568,13 @@ class BotService {
             (tamanho?['quantidadeAcompanhamentos'] as num?)?.toInt() ?? 1;
         item['quantidadeAcompanhamentos'] = quantidadeAcompanhamentos;
       }
+      if (misturas.length <= quantidadeMisturas &&
+          misturas.length == quantidadeMisturas) {
+        item.remove('misturasPendentesValidacao');
+      }
+      if (acompanhamentos.length == quantidadeAcompanhamentos) {
+        item.remove('acompanhamentosPendentesValidacao');
+      }
       final mistura = misturas.isEmpty ? null : misturas.first;
       final acompanhamento =
           acompanhamentos.isEmpty ? null : acompanhamentos.first;
@@ -1513,13 +1631,13 @@ class BotService {
           'feijão',
         );
       } else if (misturas.length > quantidadeMisturas) {
+        item['misturasPendentesValidacao'] =
+            misturas.map((opcao) => opcao['nome'].toString()).toList();
         item['misturas'] = <String>[];
         item['mistura'] = null;
-        perguntaPendente = _perguntaOpcaoIA(
-          'Quais misturas você prefere?',
-          _itensAtivos(cardapio, 'misturas'),
-          'mistura',
-        );
+        perguntaPendente = 'Esse tamanho permite escolher até '
+            '$quantidadeMisturas ${quantidadeMisturas == 1 ? 'mistura' : 'misturas'}, '
+            'mas você mencionou ${misturas.length}. Quais deseja manter?';
       } else if (misturas.length < quantidadeMisturas) {
         final referencia = _referenciaMarmitaIa(
           itens,
@@ -1542,13 +1660,13 @@ class BotService {
           'mistura',
         );
       } else if (acompanhamentos.length > quantidadeAcompanhamentos) {
+        item['acompanhamentosPendentesValidacao'] =
+            acompanhamentos.map((opcao) => opcao['nome'].toString()).toList();
         item['acompanhamentos'] = <String>[];
         item['acompanhamento'] = null;
-        perguntaPendente = _perguntaOpcaoIA(
-          'Quais acompanhamentos você prefere?',
-          _itensAtivos(cardapio, 'acompanhamentos'),
-          'acompanhamento',
-        );
+        perguntaPendente = 'Esse tamanho permite escolher até '
+            '$quantidadeAcompanhamentos ${quantidadeAcompanhamentos == 1 ? 'acompanhamento' : 'acompanhamentos'}, '
+            'mas você mencionou ${acompanhamentos.length}. Quais deseja manter?';
       } else if (acompanhamentos.length < quantidadeAcompanhamentos) {
         final referencia = _referenciaMarmitaIa(
           itens,
@@ -1573,7 +1691,10 @@ class BotService {
       } else if (quantidade == null) {
         perguntaPendente = 'Quantas marmitas iguais a essa você gostaria?';
       }
-      if (perguntaPendente != null) break;
+      if (perguntaPendente != null) {
+        indicePerguntaPendente = i;
+        break;
+      }
       if (tamanho == null ||
           mistura == null ||
           acompanhamento == null ||
@@ -1607,13 +1728,36 @@ class BotService {
             acompanhamentos.map((opcao) => opcao['id']).toList(),
         'acompanhamentoNomes':
             acompanhamentos.map((opcao) => opcao['nome']).toList(),
+        'itemIds': [item['itemId']],
+        'statusValidacao': 'validado',
+        'pendenciasObrigatorias': <String>[],
+        if (item['historicoAlteracoes'] is List)
+          'historicoAlteracoes': (item['historicoAlteracoes'] as List)
+              .whereType<Map>()
+              .map((registro) => {
+                    ...Map<String, dynamic>.from(registro),
+                    'itemId': item['itemId'],
+                  })
+              .toList(),
+        if (item['observacao'] is String &&
+            (item['observacao'] as String).trim().isNotEmpty)
+          'observacao': (item['observacao'] as String).trim(),
         'quantidade': quantidade,
         if (!arrozAtivo) 'arrozDesativado': true,
         if (!feijaoAtivo) 'feijaoDesativado': true,
       });
     }
 
+    _atualizarPendenciasValidacaoRascunho(itens, cardapio);
+
     if (perguntaPendente != null) {
+      perguntaPendente = _contextualizarProximaMarmita(
+        itens,
+        indicePerguntaPendente,
+        perguntaPendente,
+        arrozAtivo: cardapio['fluxoArrozAtivo'] == true,
+        feijaoAtivo: cardapio['fluxoFeijaoAtivo'] == true,
+      );
       if (normalizados.isNotEmpty) {
         dados['itens'] = normalizados;
       }
@@ -1639,6 +1783,7 @@ class BotService {
         item['feijaoDesativado'],
         _chaveIdsEscolhas(item['misturaIds'], item['misturaId']),
         _chaveIdsEscolhas(item['acompanhamentoIds'], item['acompanhamentoId']),
+        item['observacao']?.toString().trim() ?? '',
       ].join('|');
       final existente = agregados[chave];
       if (existente == null) {
@@ -1652,6 +1797,29 @@ class BotService {
           return;
         }
         existente['quantidade'] = total;
+        final idsExistentes = (existente['itemIds'] as List? ?? const [])
+            .map((id) => id.toString())
+            .toList();
+        idsExistentes.addAll(
+          (item['itemIds'] as List? ?? const []).map((id) => id.toString()),
+        );
+        existente['itemIds'] = idsExistentes.toSet().toList();
+        final historicoExistente =
+            (existente['historicoAlteracoes'] as List? ?? const [])
+                .whereType<Map>()
+                .map((registro) => Map<String, dynamic>.from(registro))
+                .toList();
+        historicoExistente.addAll(
+          (item['historicoAlteracoes'] as List? ?? const [])
+              .whereType<Map>()
+              .map((registro) => {
+                    ...Map<String, dynamic>.from(registro),
+                    'itemId': item['itemId'],
+                  }),
+        );
+        if (historicoExistente.isNotEmpty) {
+          existente['historicoAlteracoes'] = historicoExistente;
+        }
       }
     }
     dados['itens'] = agregados.values.toList();
@@ -2065,6 +2233,316 @@ class BotService {
         (!feijaoAtivo || item['feijao'] != null);
   }
 
+  void _atualizarPendenciasValidacaoRascunho(
+    List<Map<String, dynamic>> itens,
+    Map<String, dynamic> cardapio,
+  ) {
+    final tamanhos = _itensAtivos(cardapio, 'tamanhos');
+    for (final item in itens) {
+      final pendencias = <String>[];
+      var invalido = false;
+      final tamanho = item['tamanho'] is String
+          ? _resolverTamanhoOpcaoNatural(item['tamanho'] as String, tamanhos)
+          : null;
+      if (tamanho == null) {
+        pendencias.add('tamanho');
+        if (item['tamanho'] != null) invalido = true;
+      }
+      final quotaMisturas =
+          (tamanho?['quantidadeMisturas'] as num?)?.toInt() ?? 1;
+      final quotaAcompanhamentos =
+          (tamanho?['quantidadeAcompanhamentos'] as num?)?.toInt() ?? 1;
+      final valoresMistura =
+          _valoresEscolhidosRascunho(item, 'misturas', 'mistura');
+      final valoresAcompanhamento = _valoresEscolhidosRascunho(
+        item,
+        'acompanhamentos',
+        'acompanhamento',
+      );
+      final misturasValidas = _resolverListaOpcoesNaturais(
+        valoresMistura,
+        _itensAtivos(cardapio, 'misturas'),
+      );
+      final acompanhamentosValidos = _resolverListaOpcoesNaturais(
+        valoresAcompanhamento,
+        _itensAtivos(cardapio, 'acompanhamentos'),
+      );
+      if (item.containsKey('misturasPendentesValidacao') ||
+          misturasValidas.length > quotaMisturas ||
+          misturasValidas.length != valoresMistura.length) {
+        invalido = true;
+      }
+      if (misturasValidas.length < quotaMisturas) pendencias.add('mistura');
+      if (item.containsKey('acompanhamentosPendentesValidacao') ||
+          acompanhamentosValidos.length > quotaAcompanhamentos ||
+          acompanhamentosValidos.length != valoresAcompanhamento.length) {
+        invalido = true;
+      }
+      if (acompanhamentosValidos.length < quotaAcompanhamentos) {
+        pendencias.add('acompanhamento');
+      }
+      if (cardapio['fluxoArrozAtivo'] == true &&
+          _resolverOpcaoNatural(
+                  item['arroz'], _itensAtivos(cardapio, 'arrozes')) ==
+              null) {
+        pendencias.add('arroz');
+      }
+      if (cardapio['fluxoFeijaoAtivo'] == true &&
+          _resolverOpcaoNatural(
+                  item['feijao'], _itensAtivos(cardapio, 'feijoes')) ==
+              null) {
+        pendencias.add('feijão');
+      }
+      if (item['quantidade'] is! num ||
+          (item['quantidade'] as num) < 1 ||
+          (item['quantidade'] as num) > 50) {
+        pendencias.add('quantidade');
+        if (item['quantidade'] != null) invalido = true;
+      }
+      item['pendenciasObrigatorias'] = pendencias.toSet().toList();
+      item['statusValidacao'] = invalido
+          ? 'invalido'
+          : pendencias.isEmpty
+              ? 'validado'
+              : 'pendente';
+    }
+  }
+
+  void _garantirIdsItensRascunho(
+    Map<String, dynamic> rascunho,
+    List<Map<String, dynamic>> itens,
+  ) {
+    final usados = <String>{};
+    var proximo = rascunho['proximoItemId'] is num
+        ? (rascunho['proximoItemId'] as num).toInt()
+        : 1;
+    if (proximo < 1) proximo = 1;
+    for (final item in itens) {
+      final id = item['itemId']?.toString().trim() ?? '';
+      if (id.isNotEmpty && usados.add(id)) continue;
+      while (usados.contains('marmita-$proximo')) {
+        proximo++;
+      }
+      final novoId = 'marmita-$proximo';
+      item['itemId'] = novoId;
+      usados.add(novoId);
+      proximo++;
+    }
+    rascunho['proximoItemId'] = proximo;
+  }
+
+  void _registrarHistoricoAlteracoesRascunho(
+    Map<String, dynamic> item,
+    Map<String, dynamic> estadoAnterior,
+    Map<String, dynamic> cardapio,
+  ) {
+    final tamanho = item['tamanho'] is String
+        ? _resolverTamanhoOpcaoNatural(
+            item['tamanho'] as String,
+            _itensAtivos(cardapio, 'tamanhos'),
+          )
+        : null;
+    List<String> nomesResolvidos(String plural, String singular, String menu) {
+      return _resolverListaOpcoesNaturais(
+        _valoresEscolhidosRascunho(item, plural, singular),
+        _itensAtivos(cardapio, menu),
+      ).map((opcao) => opcao['nome'].toString()).toList();
+    }
+
+    final arroz = cardapio['fluxoArrozAtivo'] == true
+        ? _resolverOpcaoNatural(
+            item['arroz'], _itensAtivos(cardapio, 'arrozes'))
+        : null;
+    final feijao = cardapio['fluxoFeijaoAtivo'] == true
+        ? _resolverOpcaoNatural(
+            item['feijao'], _itensAtivos(cardapio, 'feijoes'))
+        : null;
+
+    final estadoAtual = <String, dynamic>{
+      'tamanho': tamanho?['nome'],
+      'misturas': nomesResolvidos('misturas', 'mistura', 'misturas'),
+      'acompanhamentos': nomesResolvidos(
+        'acompanhamentos',
+        'acompanhamento',
+        'acompanhamentos',
+      ),
+      'arroz': arroz?['nome'],
+      'feijao': feijao?['nome'],
+      'quantidade': item['quantidade'] is num
+          ? (item['quantidade'] as num).toInt()
+          : null,
+      'observacao': item['observacao'] is String
+          ? (item['observacao'] as String).trim()
+          : null,
+    };
+    final historico = (item['historicoAlteracoes'] as List? ?? const [])
+        .whereType<Map>()
+        .map((registro) => Map<String, dynamic>.from(registro))
+        .toList();
+    for (final campo in estadoAtual.keys) {
+      final antes = estadoAnterior[campo];
+      final depois = estadoAtual[campo];
+      if (jsonEncode(antes) == jsonEncode(depois) ||
+          depois == null ||
+          (depois is List && depois.isEmpty)) {
+        continue;
+      }
+      historico.add({
+        'campo': campo,
+        'antes': antes,
+        'depois': depois,
+        'em': agoraIso(),
+      });
+    }
+    if (historico.isNotEmpty) {
+      item['historicoAlteracoes'] = historico.length > 100
+          ? historico.sublist(historico.length - 100)
+          : historico;
+    }
+  }
+
+  List<Map<String, dynamic>> _expandirReferenciasCompartilhadas(
+    String entrada,
+    List<Map> interpretados,
+    List<Map<String, dynamic>> itens,
+    Map<String, dynamic> cardapio,
+  ) {
+    final resultado =
+        interpretados.map((item) => Map<String, dynamic>.from(item)).toList();
+    final texto = _normalizarIntencao(entrada);
+    final compartilhado = RegExp(
+      r'\b(?:nas duas|em ambas|para as duas|em todas|nos dois|para ambos)\b',
+    ).hasMatch(texto);
+    var referenciaAmbigua = false;
+
+    // Uma referência explícita a um tamanho é segura para corrigir o índice
+    // retornado pelo modelo somente quando há exatamente uma marmita daquele
+    // tamanho e a interpretação contém uma única atualização.
+    if (resultado.length == 1) {
+      final tamanhos = _itensAtivos(cardapio, 'tamanhos');
+      final citados = tamanhos.where((opcao) {
+        final nome = _normalizarIntencao(opcao['nome']?.toString() ?? '');
+        if (nome.isEmpty) return false;
+        return RegExp(
+          r'\b(?:na|para a|da|na marmita|marmita)\s+' +
+              RegExp.escape(nome) +
+              r'\b',
+        ).hasMatch(texto);
+      }).toList();
+      if (citados.length == 1) {
+        final ids = <int>[];
+        for (var i = 0; i < itens.length; i++) {
+          final tamanho = itens[i]['tamanho'] is String
+              ? _resolverTamanhoOpcaoNatural(
+                  itens[i]['tamanho'] as String,
+                  tamanhos,
+                )
+              : null;
+          if (tamanho?['id'] == citados.single['id']) ids.add(i);
+        }
+        if (ids.length == 1) {
+          resultado.single['indice'] = ids.single + 1;
+        } else if (ids.length > 1) {
+          resultado.single['_referenciaAmbigua'] = true;
+          resultado.single['_alvosReferenciaAmbigua'] =
+              ids.map((indice) => indice + 1).toList();
+          referenciaAmbigua = true;
+        }
+      }
+    }
+
+    if (referenciaAmbigua ||
+        !compartilhado ||
+        itens.length < 2 ||
+        resultado.isEmpty) {
+      return resultado;
+    }
+
+    const campos = [
+      ('mistura', 'misturas', 'misturas'),
+      ('acompanhamento', 'acompanhamentos', 'acompanhamentos'),
+      ('arroz', 'arroz', 'arrozes'),
+      ('feijao', 'feijao', 'feijoes'),
+    ];
+    final porIndice = <int, Map<String, dynamic>>{
+      for (final item in resultado)
+        if (item['indice'] is num) (item['indice'] as num).toInt(): item,
+    };
+    for (final (singular, plural, colecao) in campos) {
+      if ((singular == 'arroz' && cardapio['fluxoArrozAtivo'] != true) ||
+          (singular == 'feijao' && cardapio['fluxoFeijaoAtivo'] != true)) {
+        continue;
+      }
+      final candidatos = resultado.where((item) {
+        final valor = item[plural] ?? item[singular];
+        return valor != null &&
+            (valor is! String || valor.trim().isNotEmpty) &&
+            (valor is! List || valor.isNotEmpty);
+      }).toList();
+      if (candidatos.isEmpty) continue;
+
+      List<String> nomes(Map<String, dynamic> item) {
+        final valor = item[plural] ?? item[singular];
+        final lista = valor is List ? valor : [valor];
+        return lista
+            .whereType<Object>()
+            .map((opcao) => opcao.toString().trim())
+            .where((opcao) => opcao.isNotEmpty)
+            .toList();
+      }
+
+      // Só propaga uma escolha não ambígua: as atualizações do modelo precisam
+      // concordar sobre os mesmos valores para esta categoria.
+      final valoresPorAtualizacao = candidatos
+          .map(nomes)
+          .map((lista) => lista.map(_normalizarIntencao).join('|'))
+          .toSet();
+      if (valoresPorAtualizacao.length != 1) continue;
+      final escolhidos = nomes(candidatos.first);
+      final oficiais = _resolverListaOpcoesNaturais(
+          escolhidos, _itensAtivos(cardapio, colecao));
+      if (oficiais.length != escolhidos.length) continue;
+      final nomesOficiais =
+          oficiais.map((opcao) => opcao['nome'].toString()).toList();
+
+      for (var i = 0; i < itens.length; i++) {
+        final tamanho = itens[i]['tamanho'] is String
+            ? _resolverTamanhoOpcaoNatural(
+                itens[i]['tamanho'] as String,
+                _itensAtivos(cardapio, 'tamanhos'),
+              )
+            : null;
+        final quota = singular == 'mistura'
+            ? (tamanho?['quantidadeMisturas'] as num?)?.toInt() ?? 1
+            : singular == 'acompanhamento'
+                ? (tamanho?['quantidadeAcompanhamentos'] as num?)?.toInt() ?? 1
+                : 1;
+        if (nomesOficiais.length > quota) continue;
+        final atuais = _valoresEscolhidosRascunho(
+          itens[i],
+          singular == 'mistura'
+              ? 'misturas'
+              : singular == 'acompanhamento'
+                  ? 'acompanhamentos'
+                  : singular,
+          singular,
+        );
+        if (atuais.isNotEmpty &&
+            atuais.map(_normalizarIntencao).toList().toString() !=
+                nomesOficiais.map(_normalizarIntencao).toList().toString()) {
+          continue;
+        }
+        final update = porIndice.putIfAbsent(
+          i + 1,
+          () => <String, dynamic>{'indice': i + 1},
+        );
+        update[plural] = nomesOficiais;
+        if (nomesOficiais.isNotEmpty) update[singular] = nomesOficiais.first;
+      }
+    }
+    return porIndice.values.toList();
+  }
+
   List<String> _valoresEscolhidosRascunho(
     Map<String, dynamic> item,
     String campoPlural,
@@ -2276,6 +2754,21 @@ class BotService {
     final escolhido = campo == 'tamanho'
         ? _resolverTamanhoOpcaoNatural(texto, opcoes)
         : _resolverOpcaoNatural(texto, opcoes);
+    if (escolhido == null && campo == 'mistura') {
+      // Se o cliente responder o acompanhamento antes da mistura, registre a
+      // escolha correta sem fazê-lo repetir; o fluxo continuará pedindo apenas
+      // a mistura que ainda falta.
+      final acompanhamento = _resolverOpcaoNatural(
+        texto,
+        _itensAtivos(cardapio, 'acompanhamentos'),
+      );
+      if (acompanhamento != null) {
+        return {
+          'indice': indice,
+          'acompanhamento': acompanhamento['nome']?.toString(),
+        };
+      }
+    }
     if (escolhido == null && campo == 'acompanhamento') {
       // Customers sometimes give the next marmita's mixture while we are
       // still collecting this marmita's accompaniment. Keep it on that next
@@ -2309,7 +2802,7 @@ class BotService {
     if (_ehPerguntaExplicita(entrada)) return null;
     final texto = _normalizarIntencao(entrada);
     final match = RegExp(
-      r'^(?:eu\s+)?(?:quero|queria|gostaria\s+de|vou)?\s*(?:trocar|troca|mudar|muda|colocar|coloca|passar|passa|alterar|altera)\s+(?:a|o|as|os)?\s*(mistura|acompanhamento)\s+(?:para|por)\s+(.+)$',
+      r'^(?:(?:na\s+verdade|alias|corrigindo)\s+)?(?:eu\s+)?(?:quero|queria|gostaria\s+de|vou)?\s*(?:trocar|troca|mudar|muda|colocar|coloca|passar|passa|alterar|altera)\s+(?:a|o|as|os)?\s*(mistura|acompanhamento)\s+(?:para|por)\s+(.+)$',
     ).firstMatch(texto);
     final cardapio = banco.obterCardapio();
     String? campo = match?.group(1);
@@ -2320,7 +2813,7 @@ class BotService {
       // A categoria é inferida somente quando a opção de origem e a nova
       // opção apontam sem ambiguidade para a mesma lista do cardápio.
       final troca = RegExp(
-        r'^(?:eu\s+)?(?:quero|queria|gostaria\s+de|vou)?\s*(?:trocar|troca|mudar|muda|colocar|coloca|passar|passa|alterar|altera)\s+(?:a|o|as|os)?\s*(.+?)\s+(?:para|por|no lugar de)\s+(.+)$',
+        r'^(?:(?:na\s+verdade|alias|corrigindo)\s+)?(?:eu\s+)?(?:quero|queria|gostaria\s+de|vou)?\s*(?:trocar|troca|mudar|muda|colocar|coloca|passar|passa|alterar|altera)\s+(?:a|o|as|os)?\s*(.+?)\s+(?:para|por|no lugar de)\s+(.+)$',
       ).firstMatch(texto);
       if (troca == null) return null;
       origem = troca.group(1)?.trim();
@@ -7957,6 +8450,8 @@ class BotService {
         '🍽️ ${_nomeEscolhasItem(item, 'misturaNomes', 'misturaNome')} • '
         '${_nomeEscolhasItem(item, 'acompanhamentoNomes', 'acompanhamentoNome')}',
       );
+      final observacaoItem = item['observacao']?.toString().trim() ?? '';
+      if (observacaoItem.isNotEmpty) linhas.add('📝 $observacaoItem');
       if (item['saladaIncluida'] == true) {
         linhas.add('🥗 ${item['descricaoSalada'] ?? 'Salada'}');
       }
@@ -9089,6 +9584,8 @@ class BotService {
       final detalhes = <String>[
         if (item['mistura'] != null) item['mistura'].toString(),
         if (item['acompanhamento'] != null) item['acompanhamento'].toString(),
+        if (item['observacao']?.toString().trim().isNotEmpty ?? false)
+          'observação: ${item['observacao'].toString().trim()}',
       ];
       final identificacao = [
         if (quantidade != null) '${quantidade}x',
@@ -9193,12 +9690,59 @@ class BotService {
     });
     final temMultiplas = totalRepresentado > 1 || (totalSolicitado ?? 0) > 1;
     if (!temMultiplas) return 'na sua marmita';
-    final repetida = itens.take(indice).any((anterior) =>
-        _normalizar(anterior['tamanho']?.toString() ?? '') ==
-        _normalizar(tamanho));
-    return repetida
-        ? 'para a próxima marmita ${tamanho.toLowerCase()}'
-        : 'para sua marmita ${tamanho.toLowerCase()}';
+    final repeticoesAnteriores = itens
+        .take(indice)
+        .where((anterior) =>
+            _normalizar(anterior['tamanho']?.toString() ?? '') ==
+            _normalizar(tamanho))
+        .length;
+    if (repeticoesAnteriores > 0) {
+      return 'para ${repeticoesAnteriores == 1 ? 'a outra' : 'a próxima'} '
+          'marmita ${tamanho.toLowerCase()}';
+    }
+    return 'para uma marmita ${tamanho.toLowerCase()}';
+  }
+
+  String _contextualizarProximaMarmita(
+    List<Map<String, dynamic>> itens,
+    int indice,
+    String pergunta, {
+    required bool arrozAtivo,
+    required bool feijaoAtivo,
+  }) {
+    if (indice <= 0 || indice >= itens.length) return pergunta;
+    final anterior = itens[indice - 1];
+    if (!_rascunhoItemCompleto(
+      anterior,
+      arrozAtivo: arrozAtivo,
+      feijaoAtivo: feijaoAtivo,
+    )) {
+      return pergunta;
+    }
+    final tamanho = anterior['tamanho']?.toString().trim() ?? '';
+    final misturas = _valoresEscolhidosRascunho(
+      anterior,
+      'misturas',
+      'mistura',
+    );
+    final acompanhamentos = _valoresEscolhidosRascunho(
+      anterior,
+      'acompanhamentos',
+      'acompanhamento',
+    );
+    final detalhes = <String>[
+      if (misturas.isNotEmpty) _juntarEmPortugues(misturas),
+      if (acompanhamentos.isNotEmpty) _juntarEmPortugues(acompanhamentos),
+    ];
+    if (tamanho.isEmpty || detalhes.isEmpty) return pergunta;
+    final quantidade = anterior['quantidade'] is num
+        ? (anterior['quantidade'] as num).toInt()
+        : 1;
+    final perguntaContinua = pergunta.isEmpty
+        ? pergunta
+        : '${pergunta[0].toLowerCase()}${pergunta.substring(1)}';
+    return 'Anotei ${quantidade > 1 ? '$quantidade marmitas' : 'uma marmita'} '
+        '$tamanho com ${detalhes.join(' e ')}. Agora, $perguntaContinua';
   }
 
   bool _ehComandoCorrigir(String entrada) => _correspondeIntencao(entrada, [

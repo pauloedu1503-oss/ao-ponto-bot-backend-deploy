@@ -10,6 +10,15 @@ import makeWASocket, {
 
 import { Boom } from '@hapi/boom';
 import qrcode from 'qrcode-terminal';
+import {
+  desembrulharMensagem,
+  extrairTexto,
+  jidParaEnvio as resolverJidParaEnvio,
+  somenteNumero,
+  transformarInterativoEmTexto,
+} from './bridge_utils.js';
+import { processarFilaSaidas } from './saida_queue.js';
+import { AckTracker } from './ack_tracker.js';
 
 const BACKEND = process.env.BACKEND_URL || 'http://127.0.0.1:8080';
 const DIRETORIO_AUTH = path.resolve(
@@ -29,7 +38,7 @@ let timerReconexao = null;
 let conectando = false;
 let falhasConsecutivas = 0;
 let ultimaConexaoAberta = 0;
-const confirmacoesEnvio = new Map();
+const confirmacoesEnvio = new AckTracker({ timeoutMs: 8000 });
 
 function lerEnv() {
   const resultado = { ...process.env };
@@ -213,14 +222,6 @@ async function chamarBackend(
   return dados;
 }
 
-function somenteNumero(jid) {
-  return (
-    jid
-      ?.split('@')[0]
-      ?.replace(/\D/g, '') ?? ''
-  );
-}
-
 function identificarCliente(msg) {
   const jidPrincipal =
     msg.key.remoteJid ?? '';
@@ -274,153 +275,8 @@ function identificarCliente(msg) {
   };
 }
 
-function desembrulharMensagem(message) {
-  let atual = message;
-
-  while (atual) {
-    if (atual.ephemeralMessage?.message) {
-      atual =
-        atual.ephemeralMessage.message;
-      continue;
-    }
-
-    if (
-      atual.viewOnceMessage?.message
-    ) {
-      atual =
-        atual.viewOnceMessage.message;
-      continue;
-    }
-
-    if (
-      atual.viewOnceMessageV2?.message
-    ) {
-      atual =
-        atual.viewOnceMessageV2.message;
-      continue;
-    }
-
-    if (
-      atual.documentWithCaptionMessage
-        ?.message
-    ) {
-      atual =
-        atual.documentWithCaptionMessage
-          .message;
-      continue;
-    }
-
-    break;
-  }
-
-  return atual ?? {};
-}
-
-function extrairTexto(message) {
-  const m =
-    desembrulharMensagem(message);
-
-  return (
-    m.conversation ??
-    m.extendedTextMessage?.text ??
-    m.imageMessage?.caption ??
-    m.videoMessage?.caption ??
-    m.buttonsResponseMessage
-      ?.selectedDisplayText ??
-    m.listResponseMessage?.title ??
-    m.templateButtonReplyMessage
-      ?.selectedDisplayText ??
-    ''
-  );
-}
-
 function jidParaEnvio(telefone) {
-  const salvo =
-    contatos[telefone];
-
-  if (salvo) {
-    return salvo;
-  }
-
-  // Para números normais que ainda não possuem
-  // mapeamento salvo.
-  if (/^\d{10,15}$/.test(telefone)) {
-    return `${telefone}@s.whatsapp.net`;
-  }
-
-  return null;
-}
-
-function transformarInterativoEmTexto(payload) {
-  const interactive = payload.interactive;
-
-  if (!interactive) {
-    return '';
-  }
-
-  const linhas = [];
-
-  const pergunta =
-    interactive.body?.text?.trim() ?? '';
-
-  // REGRA GLOBAL:
-  // sempre deixa uma linha vazia entre
-  // a pergunta e as opções.
-  if (pergunta) {
-    linhas.push(pergunta);
-    linhas.push('');
-  }
-
-  // Quando o backend já incluiu opções numeradas para preservar nomes longos,
-  // não repete abaixo os rótulos curtos dos botões/listas.
-  if (pergunta.split('\n').some((linha) => /^\s*\d+\s*-\s+\S/.test(linha))) {
-    return pergunta;
-  }
-
-  if (interactive.type === 'button') {
-    const botoes =
-      interactive.action?.buttons ?? [];
-
-    botoes.forEach((botao, indice) => {
-      linhas.push(
-        `${indice + 1} - ${
-          botao.reply?.title ?? ''
-        }`,
-      );
-    });
-  }
-
-  if (interactive.type === 'list') {
-    let indice = 1;
-
-    const secoes =
-      interactive.action?.sections ?? [];
-
-    for (const secao of secoes) {
-      for (const linha of secao.rows ?? []) {
-        linhas.push(
-          `${indice} - ${
-            linha.title ?? ''
-          }`,
-        );
-
-        indice++;
-      }
-    }
-  }
-
-  return linhas
-    .filter((linha, indice, array) => {
-      // Mantém a linha vazia entre pergunta/opções,
-      // mas evita excesso no final.
-      if (linha !== '') return true;
-
-      return (
-        indice > 0 &&
-        indice < array.length - 1
-      );
-    })
-    .join('\n');
+  return resolverJidParaEnvio(telefone, contatos);
 }
 
 async function enviarTextoConfirmado(jid, texto) {
@@ -433,19 +289,7 @@ async function enviarConteudoConfirmado(jid, conteudo) {
   for (let tentativa = 1; tentativa <= 2; tentativa++) {
     const id = generateMessageIDV2(sockAtual?.user?.id);
 
-    let timer = null;
-    const confirmacao = new Promise((resolve, reject) => {
-      timer = setTimeout(() => {
-        confirmacoesEnvio.delete(id);
-        reject(new Error('O WhatsApp não confirmou o envio em 8 segundos.'));
-      }, 8000);
-
-      confirmacoesEnvio.set(id, {
-        resolve,
-        reject,
-        timer,
-      });
-    });
+    const confirmacao = confirmacoesEnvio.registrar(id);
 
     try {
       await sockAtual.sendMessage(
@@ -458,11 +302,7 @@ async function enviarConteudoConfirmado(jid, conteudo) {
       return;
     } catch (erro) {
       ultimaFalha = erro;
-      const pendente = confirmacoesEnvio.get(id);
-      if (pendente) {
-        clearTimeout(pendente.timer);
-        confirmacoesEnvio.delete(id);
-      }
+      confirmacoesEnvio.cancelar(id);
 
       const codigo = erro?.codigo?.toString() ?? '';
       if (tentativa === 1 && (codigo === '403' || codigo === '463')) {
@@ -677,77 +517,12 @@ async function buscarSaidas() {
     const mensagens =
       dados.mensagens ?? [];
 
-    for (const item of mensagens) {
-      const id =
-        Number(item.id);
-
-      const payload =
-        item.payload;
-
-      if (
-        !Number.isInteger(id) ||
-        id <= 0 ||
-        !payload
-      ) {
-        console.error(
-          'Item inválido recebido da fila:',
-          item,
-        );
-
-        continue;
-      }
-
-      try {
-        await enviarSaida(payload);
-
-        // Só depois que o Baileys terminou
-        // o envio marcamos como enviado.
-        await informarResultadoSaida(
-          id,
-          'enviado',
-        );
-
-        console.log(
-          `✓ Resposta #${id} enviada.`,
-        );
-      } catch (erroEnvio) {
-        console.error(
-          `Falha ao enviar resposta #${id}:`,
-          erroEnvio.message,
-        );
-
-        try {
-          await informarResultadoSaida(
-            id,
-            'incerto',
-            erroEnvio.message,
-          );
-
-          console.error(
-            `Resposta #${id} marcada como INCERTA. ` +
-            'Ela não será reenviada automaticamente.',
-          );
-        } catch (erroConfirmacao) {
-          console.error('');
-          console.error(
-            `ATENÇÃO: não consegui registrar o resultado ` +
-            `da resposta #${id}.`,
-          );
-
-          console.error(
-            erroConfirmacao.message,
-          );
-
-          console.error(
-            'A fila ficará parada por segurança para evitar duplicidade.',
-          );
-        }
-
-        // Não tenta mensagens seguintes quando existe
-        // uma saída de resultado duvidoso.
-        break;
-      }
-    }
+    await processarFilaSaidas(mensagens, {
+      enviar: enviarSaida,
+      informarResultado: informarResultadoSaida,
+      aoIgnorar: (item) => console.error('Item inválido recebido da fila:', item),
+      aoFalhar: (id, erro) => console.error(`Falha ao processar resposta #${id}:`, erro.message),
+    });
   } catch (erro) {
     console.error(
       'Falha ao buscar respostas do bot:',
@@ -902,30 +677,14 @@ async function conectar() {
 
   sock.ev.on('messages.update', (atualizacoes) => {
     for (const item of atualizacoes) {
-      const id = item.key?.id;
-      const pendente = id ? confirmacoesEnvio.get(id) : null;
-      if (!pendente) continue;
-
       const status = item.update?.status;
-      if (status === WAMessageStatus.ERROR) {
-        clearTimeout(pendente.timer);
-        confirmacoesEnvio.delete(id);
-        const codigo = item.update?.messageStubParameters?.[0]?.toString() ?? '';
-        const erro = new Error(
-          codigo
-            ? `WhatsApp recusou a mensagem (erro ${codigo}).`
-            : 'WhatsApp recusou a mensagem.',
-        );
-        erro.codigo = codigo;
-        pendente.reject(erro);
-      } else if (
-        typeof status === 'number' &&
-        status >= WAMessageStatus.SERVER_ACK
-      ) {
-        clearTimeout(pendente.timer);
-        confirmacoesEnvio.delete(id);
-        pendente.resolve();
-      }
+      confirmacoesEnvio.processar({
+        id: item.key?.id,
+        status,
+        errorStatus: WAMessageStatus.ERROR,
+        serverAck: WAMessageStatus.SERVER_ACK,
+        errorCode: item.update?.messageStubParameters?.[0],
+      });
     }
   });
 

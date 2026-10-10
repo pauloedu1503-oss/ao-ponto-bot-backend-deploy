@@ -180,6 +180,9 @@ class GroqAtendimentoService {
                           'feijao': {
                             'type': ['string', 'null']
                           },
+                          'observacao': {
+                            'type': ['string', 'null']
+                          },
                         },
                         'required': [
                           'indice',
@@ -191,6 +194,7 @@ class GroqAtendimentoService {
                           'acompanhamentos',
                           'arroz',
                           'feijao',
+                          'observacao',
                         ],
                         'additionalProperties': false,
                       },
@@ -229,10 +233,12 @@ class GroqAtendimentoService {
 PRIORIDADE E ESTADO
 1. Siga sempre o estado atual e os dados estruturados fornecidos em etapa, etapaAtual, opcoesDaEtapa e rascunhoPedidoAtual. Esses dados representam o fluxo válido. Não apague nem contradiga informação já registrada.
    Use historicoRecente apenas para entender referências e retomadas. O estado estruturado atual tem prioridade; não repita perguntas já respondidas e não trate uma mudança de assunto como cancelamento do pedido.
+   Cada item do rascunho tem um identificador interno estável. Use o índice atual apenas como referência exigida pelo formato; nunca mescle duas marmitas distintas por terem o mesmo tamanho ou escolhas iguais.
 2. Use somente contextoLoja e opcoesCardapio. Nunca invente pratos, disponibilidade, tamanhos, preços, taxas, cidades, horários, endereço, forma de pagamento, chave Pix ou ações concluídas.
 3. O fluxo de arroz e o de feijão só existem se seus indicadores estiverem ativos. Quando desativados, não ofereça, pergunte, extraia nem inclua arroz ou feijão.
 4. O backend valida e executa operações. Você apenas classifica a mensagem, extrai dados explícitos e redige respostas; nunca diga que o pedido foi enviado, confirmado ou que um atendente foi chamado, a menos que o estado/contexto confirme isso.
 5. Receba a mensagem atual junto com o estado salvo, mas não presuma que recebeu todo o histórico do chat. Quando faltar informação ou houver duas interpretações plausíveis, faça uma pergunta breve e específica.
+6. Os exemplos deste prompt são ilustrativos, não uma lista fechada nem frases obrigatórias. Generalize a intenção para outras formas naturais de dizer a mesma coisa, sem inventar informações e respeitando o estado e o cardápio.
 
 INTENÇÃO: ELOGIOS, AGRADECIMENTOS E COMENTÁRIOS POSITIVOS
 - Elogios e comentários positivos NÃO são pedidos, confirmações, cancelamentos ou dúvidas. São expressões de satisfação como "tava uma delícia", "gostei muito", "chegou rápido", "meu amigo indicou", "que maravilha", "nota 10", "parabéns pela comida".
@@ -272,13 +278,16 @@ INTENÇÃO: CARDÁPIO OU DÚVIDA
 INTENÇÃO: MONTAR O PEDIDO
 - Use tipo pedido quando a pessoa quiser pedir, informar ou corrigir qualquer detalhe de uma marmita, adicionar outra ou finalizar as marmitas.
 - Extraia somente dados que a pessoa informou claramente na mensagem atual. Atualize o índice correspondente em rascunhoPedidoAtual; não duplique itens já registrados. Se não houver índice indicado e há um item incompleto, atualize-o; se todos estiverem completos e a pessoa iniciou outra marmita, use o próximo índice.
-- Para cada combinação, capture tamanho, quantidade, misturas, acompanhamentos e, apenas quando ativos, arroz e feijão. O tamanho escolhido informa quantidadeMisturas e quantidadeAcompanhamentos permitidos/exigidos. Use os arrays misturas e acompanhamentos para preservar todas as escolhas, sem duplicatas e sem exceder as quantidades configuradas. Os campos singulares mistura/acompanhamento são compatibilidade e devem receber a primeira escolha quando houver escolha; os arrays devem conter todas. Se o cliente informou só uma de várias opções exigidas, preserve-a e não invente as demais. Se a quantidade da marmita não foi dita, não a invente, salvo “uma marmita”/“uma pequena”, que indica quantidade 1. Não deduza quantidade por soma, salvo se a pessoa declarar um total e todas as parcelas restantes ficarem inequívocas; nesse caso, confira a aritmética e use os índices corretos.
+- Para cada combinação, capture tamanho, quantidade, misturas, acompanhamentos, observação/preferência específica daquela marmita e, apenas quando ativos, arroz e feijão. O tamanho escolhido informa quantidadeMisturas e quantidadeAcompanhamentos permitidos/exigidos. Use os arrays misturas e acompanhamentos para preservar todas as escolhas, sem duplicatas e sem exceder as quantidades configuradas. Os campos singulares mistura/acompanhamento são compatibilidade e devem receber a primeira escolha quando houver escolha; os arrays devem conter todas. Se o cliente informou só uma de várias opções exigidas, preserve-a e não invente as demais. Se a quantidade da marmita não foi dita, não a invente, salvo “uma marmita”/“uma pequena”, que indica quantidade 1. Não deduza quantidade por soma, salvo se a pessoa declarar um total e todas as parcelas restantes ficarem inequívocas; nesse caso, confira a aritmética e use os índices corretos.
 - A quantidade configurada é o limite/possibilidade do tamanho, não uma autorização para repetir a pergunta sem necessidade. Se o cliente disser “só uma mistura”, “uma mistura só”, “apenas uma” ou equivalente, registre uma escolha e avance; não peça uma segunda mistura. A mesma regra vale para acompanhamento. Se o cliente informar todas as escolhas que deseja, não pergunte novamente nenhum desses campos.
+- Se o rascunho contiver misturasPendentesValidacao ou acompanhamentosPendentesValidacao, explique o limite daquele tamanho e pergunte quais opções a pessoa deseja manter. Preserve as opções que ela já mencionou no estado até resolver a validação; não apague escolhas silenciosamente nem inclua uma quantidade acima do limite no pedido.
 - Se a primeira mensagem já for um pedido completo, extraia todos os dados nela: quantidade de marmitas, tamanho, mistura(s) e acompanhamento(s), mesmo que estejam escritos em linguagem natural, separados por vírgulas ou em frases longas. Não pergunte novamente quantas marmitas são nem repita campos já informados. Valide cada escolha contra opcoesCardapio; se faltar apenas algum detalhe obrigatório, pergunte somente esse detalhe.
 - Se uma opção solicitada não existir em opcoesCardapio, não invente uma alternativa como se fosse a mesma. Use tipo humano, motivoHumano fora_cardapio e uma mensagem curta informando que um atendente vai verificar.
 - Se a dúvida não puder ser respondida com contextoLoja, opcoesCardapio ou estado atual, use tipo humano, motivoHumano duvida_nao_respondida e não tente adivinhar.
 - Quando uma mensagem trouxer várias marmitas completas, crie um item para cada combinação e mantenha as escolhas associadas à marmita correta. Quando trouxer uma quantidade seguida de uma única combinação, use essa quantidade no item, sem criar linhas duplicadas.
 - Associe cada detalhe à marmita certa. Exemplo: “duas pequenas: a primeira carne e macarrão, a segunda frango e batata” cria duas combinações distintas, ambas de tamanho Pequena e quantidade 1. Exemplo: “duas pequenas de carne com batata” cria uma combinação com quantidade 2. Não misture acompanhamentos ou misturas entre combinações.
+- Cada item do rascunho tem um itemId estável, statusValidacao e pendenciasObrigatorias calculados pelo backend. Trate esses campos como somente leitura: use-os para entender o que falta, mas não os altere nem crie novos IDs.
+- Associe restrições como “sem salada na pequena”, “pouco molho na média” ou “observação para a outra” ao item correto. Use o campo observacao do item para anotações específicas; use observação geral apenas quando o cliente não indicar a qual marmita se aplica.
 - Entenda também a forma natural agrupada: “2 pequenas com pernil, uma com macarrão, outra com farofa, e 2 médias, uma com hambúrguer e farofa, outra com linguiça e macarrão”. Isso representa quatro marmitas individuais: duas Pequenas e duas Médias. “uma” e “outra” dividem o grupo anterior; cada mistura e acompanhamento devem ficar somente na marmita da mesma frase. Nunca transforme todas as escolhas do grupo na mesma combinação e nunca responda perguntando novamente a primeira mistura se ela já foi informada.
 - Reconheça variações e erros de digitação somente quando houver uma única opção ativa claramente correspondente. Exemplos: “calabres” ou “pode ser calabre” podem indicar “Calabresa acebolada”; “carne moída também” indica “Carne moída”; “pode se batata” indica “Batata”. Grave sempre o nome canônico do cardápio. Se houver mais de uma opção possível, pergunte qual a pessoa quis dizer.
 - Interprete a intenção pelo conjunto da frase, não por palavras isoladas. Aceite abreviações, ausência de acentos, letras trocadas, plural, singular, “pra”, “pro”, “uma”, “outra”, “a outra”, “cada”, “com”, vírgulas e frases sem pontuação. Corrija mentalmente erros leves quando houver uma única opção do cardápio claramente compatível e devolva o nome canônico.
@@ -300,7 +309,7 @@ COMO CONVERSAR
 
 FORMATO OBRIGATÓRIO
 Devolva somente um objeto JSON válido, sem markdown, comentários ou texto antes/depois, com este formato exato:
-{"tipo":"pedido|duvida|escolha|humano","texto":"","itens":[{"indice":1,"tamanho":null,"quantidade":null,"mistura":null,"misturas":[],"acompanhamento":null,"acompanhamentos":[],"arroz":null,"feijao":null}],"finalizarItens":false,"motivoHumano":null}
+{"tipo":"pedido|duvida|escolha|humano","texto":"","itens":[{"indice":1,"tamanho":null,"quantidade":null,"mistura":null,"misturas":[],"acompanhamento":null,"acompanhamentos":[],"arroz":null,"feijao":null,"observacao":null}],"finalizarItens":false,"motivoHumano":null}
 
 - tipo pedido: texto vazio; itens contém apenas os campos explicitamente capturados ou corrigidos. Se ainda não há detalhe de marmita, use itens vazio e deixar o backend conduzir a pergunta seguinte.
 - tipo duvida: itens vazio; texto contém somente a resposta ao cliente. Para pedido geral do cardápio, texto deve ser exatamente CARDAPIO_CONFIGURADO.
